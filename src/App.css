@@ -94,8 +94,8 @@ html {
   margin: 0 auto;
   display: flex;
   flex-direction: column;
-  gap: clamp(16px, 3vw, 28px);
-  padding: clamp(16px, 2.5vw, 24px);
+  gap: clamp(4px, 1vw, 9px);
+  padding: clamp(12px, 1.6vw, 16px);
   box-sizing: border-box;
   overflow: hidden;
 }
@@ -231,8 +231,8 @@ html {
 .filter-row {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
-  gap: 16px;
-  margin-bottom: 18px;
+  gap: 6px;
+  margin-bottom: 6px;
 }
 
 .filter-button {
@@ -240,8 +240,8 @@ html {
   flex-direction: column;
   justify-content: space-between;
   align-items: flex-start;
-  min-height: 96px;
-  padding: 18px 20px;
+  min-height: 84px;
+  padding: 16px 18px;
   border: 1px solid var(--border);
   border-radius: 14px;
   background: var(--surface);
@@ -300,12 +300,13 @@ html {
   background: var(--surface);
   border-radius: 14px;
   border: 1px solid var(--border);
-  padding: 14px 16px;
+  padding: 6px 10px;
   display: flex;
   align-items: center;
-  gap: 12px;
+  gap: 6px;
   flex-wrap: wrap;
   justify-content: space-between;
+  margin-bottom: 6px;
 }
 
 .toolbar-left,
@@ -457,10 +458,10 @@ html {
   background: var(--surface);
   border-radius: 18px;
   border: 1px solid var(--border);
-  padding: 20px;
+  padding: 18px;
   display: flex;
   flex-direction: column;
-  gap: 18px;
+  gap: 14px;
   flex: 1;
   min-height: 0;
   overflow: hidden;
@@ -469,7 +470,7 @@ html {
 .task-table {
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: 10px;
   flex: 1;
   min-height: 0;
   overflow: hidden;

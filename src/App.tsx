@@ -248,11 +248,7 @@ function reducer(state: AppState, action: Action): AppState {
       };
     }
     case "taskRemoved": {
-      console.log("[REDUCER] 处理taskRemoved, taskId:", action.taskId);
-      console.log("[REDUCER] 删除前state.tasks:", Object.keys(state.tasks));
-      console.log("[REDUCER] 删除前state.order:", state.order);
       if (!state.tasks[action.taskId]) {
-        console.warn("[REDUCER] taskRemoved但任务不存在于state中, taskId:", action.taskId);
         return state;
       }
       const tasks = { ...state.tasks };
