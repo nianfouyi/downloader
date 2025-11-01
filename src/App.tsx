@@ -1,18 +1,26 @@
 import { useEffect, useMemo, useReducer, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { openPath } from "@tauri-apps/plugin-opener";
 import "./App.css";
 
 type TaskStatus = "queued" | "downloading" | "paused" | "completed" | "error";
 type SegmentStatus = "pending" | "downloading" | "completed" | "failed" | "retrying";
 type EncryptionStatus = "unknown" | "fetching" | "ready" | "failed";
+type TaskStatusFilter = "downloading" | "standby" | "completed" | "error";
 
+const FILTER_STATUS_MAP: Record<TaskStatusFilter, TaskStatus[]> = {
+  downloading: ["downloading"],
+  standby: ["queued", "paused"],
+  completed: ["completed"],
+  error: ["error"],
+};
 interface SegmentSnapshot {
   seq: number;
   status: SegmentStatus;
-  speed_bps?: number | null;
-  size_bytes?: number | null;
+  speedBps?: number | null;
+  sizeBytes?: number | null;
   retries: number;
-  last_updated?: string | null;
+  lastUpdated?: string | null;
 }
 
 interface TaskLog {
@@ -22,47 +30,60 @@ interface TaskLog {
 
 interface EncryptionSnapshot {
   method?: string | null;
-  key_uri?: string | null;
+  keyUri?: string | null;
   status: EncryptionStatus;
   iv?: string | null;
-  last_error?: string | null;
+  lastError?: string | null;
 }
 
 interface TaskSnapshot {
   id: string;
   title: string;
-  playlist_url: string;
+  playlistUrl: string;
   quality?: string | null;
   resolution?: string | null;
   audio?: string | null;
-  playlist_type: string;
-  save_dir: string;
-  total_segments: number;
-  downloaded_segments: number;
+  playlistType: string;
+  saveDir: string;
+  totalSegments: number;
+  downloadedSegments: number;
+  downloadedBytes: number;
   progress: number;
-  speed_bps: number;
+  speedBps: number;
   status: TaskStatus;
-  eta_seconds?: number | null;
-  created_at: string;
-  last_event?: string | null;
-  average_segment_size_bytes?: number | null;
+  etaSeconds?: number | null;
+  createdAt: string;
+  lastEvent?: string | null;
+  averageSegmentSizeBytes?: number | null;
   retries: number;
   encryption?: EncryptionSnapshot | null;
   segments: SegmentSnapshot[];
   logs: TaskLog[];
-  output_path?: string | null;
+  outputPath?: string | null;
+}
+
+interface LoggingConfig {
+  maxFileSizeBytes: number;
+  maxTotalSizeBytes: number;
+}
+
+interface LogFileInfo {
+  name: string;
+  size: number;
+  modified?: string | null;
 }
 
 type FrontendEvent =
   | { type: "snapshot"; tasks: TaskSnapshot[] }
   | { type: "taskCreated"; task: TaskSnapshot }
   | { type: "taskUpdated"; task: TaskSnapshot }
-  | { type: "taskCompleted"; task_id: string; task: TaskSnapshot }
-  | { type: "taskStatus"; task_id: string; status: TaskStatus; message?: string | null }
-  | { type: "segmentUpdated"; task_id: string; segment: SegmentSnapshot }
-  | { type: "logAppended"; task_id: string; log: TaskLog }
-  | { type: "keyStatus"; task_id: string; encryption: EncryptionSnapshot }
-  | { type: "taskError"; task_id: string; message: string };
+  | { type: "taskCompleted"; taskId: string; task: TaskSnapshot }
+  | { type: "taskStatus"; taskId: string; status: TaskStatus; message?: string | null }
+  | { type: "segmentUpdated"; taskId: string; segment: SegmentSnapshot }
+  | { type: "logAppended"; taskId: string; log: TaskLog }
+  | { type: "keyStatus"; taskId: string; encryption: EncryptionSnapshot }
+  | { type: "taskError"; taskId: string; message: string }
+  | { type: "taskRemoved"; taskId: string };
 
 interface AppState {
   tasks: Record<string, TaskSnapshot>;
@@ -76,13 +97,14 @@ type Action =
   | { type: "taskCreated"; task: TaskSnapshot }
   | { type: "taskUpdated"; task: TaskSnapshot }
   | { type: "taskCompleted"; task: TaskSnapshot }
-  | { type: "taskStatus"; task_id: string; status: TaskStatus; message?: string | null }
-  | { type: "segmentUpdated"; task_id: string; segment: SegmentSnapshot }
-  | { type: "logAppended"; task_id: string; log: TaskLog }
-  | { type: "keyStatus"; task_id: string; encryption: EncryptionSnapshot }
-  | { type: "taskError"; task_id: string; message: string }
-  | { type: "setActive"; task_id: string }
-  | { type: "toggleSelect"; task_id: string }
+  | { type: "taskStatus"; taskId: string; status: TaskStatus; message?: string | null }
+  | { type: "segmentUpdated"; taskId: string; segment: SegmentSnapshot }
+  | { type: "logAppended"; taskId: string; log: TaskLog }
+  | { type: "keyStatus"; taskId: string; encryption: EncryptionSnapshot }
+  | { type: "taskError"; taskId: string; message: string }
+  | { type: "taskRemoved"; taskId: string }
+  | { type: "setActive"; taskId: string }
+  | { type: "toggleSelect"; taskId: string }
   | { type: "clearSelection" };
 
 const initialState: AppState = {
@@ -91,6 +113,8 @@ const initialState: AppState = {
   activeTaskId: null,
   selected: new Set(),
 };
+
+const LAST_SAVE_DIR_KEY = "downloader:last-save-dir";
 
 function reducer(state: AppState, action: Action): AppState {
   switch (action.type) {
@@ -137,23 +161,23 @@ function reducer(state: AppState, action: Action): AppState {
       };
     }
     case "taskStatus": {
-      const task = state.tasks[action.task_id];
+      const task = state.tasks[action.taskId];
       if (!task) return state;
       return {
         ...state,
         tasks: {
           ...state.tasks,
-          [action.task_id]: {
+          [action.taskId]: {
             ...task,
             status: action.status,
-            last_event: action.message ?? task.last_event,
+            lastEvent: action.message ?? task.lastEvent,
           },
         },
         selected: new Set(state.selected),
       };
     }
     case "segmentUpdated": {
-      const task = state.tasks[action.task_id];
+      const task = state.tasks[action.taskId];
       if (!task) return state;
       const segments = [...task.segments];
       const idx = segments.findIndex((seg) => seg.seq === action.segment.seq);
@@ -166,7 +190,7 @@ function reducer(state: AppState, action: Action): AppState {
         ...state,
         tasks: {
           ...state.tasks,
-          [action.task_id]: {
+          [action.taskId]: {
             ...task,
             segments,
           },
@@ -174,30 +198,30 @@ function reducer(state: AppState, action: Action): AppState {
       };
     }
     case "logAppended": {
-      const task = state.tasks[action.task_id];
+      const task = state.tasks[action.taskId];
       if (!task) return state;
       const logs = [...task.logs, action.log].slice(-100);
       return {
         ...state,
         tasks: {
           ...state.tasks,
-          [action.task_id]: {
+          [action.taskId]: {
             ...task,
             logs,
-            last_event: action.log.message,
+            lastEvent: action.log.message,
           },
         },
         selected: new Set(state.selected),
       };
     }
     case "keyStatus": {
-      const task = state.tasks[action.task_id];
+      const task = state.tasks[action.taskId];
       if (!task) return state;
       return {
         ...state,
         tasks: {
           ...state.tasks,
-          [action.task_id]: {
+          [action.taskId]: {
             ...task,
             encryption: action.encryption,
           },
@@ -205,29 +229,46 @@ function reducer(state: AppState, action: Action): AppState {
       };
     }
     case "taskError": {
-      const task = state.tasks[action.task_id];
+      const task = state.tasks[action.taskId];
       if (!task) return state;
       return {
         ...state,
         tasks: {
           ...state.tasks,
-          [action.task_id]: {
+          [action.taskId]: {
             ...task,
             status: "error",
-            last_event: action.message,
+            lastEvent: action.message,
           },
         },
         selected: new Set(state.selected),
       };
     }
+    case "taskRemoved": {
+      if (!state.tasks[action.taskId]) {
+        return state;
+      }
+      const tasks = { ...state.tasks };
+      delete tasks[action.taskId];
+      const order = state.order.filter((id) => id !== action.taskId);
+      const selected = new Set(state.selected);
+      selected.delete(action.taskId);
+      const activeTaskId = state.activeTaskId === action.taskId ? order[0] ?? null : state.activeTaskId;
+      return {
+        tasks,
+        order,
+        activeTaskId,
+        selected,
+      };
+    }
     case "setActive":
-      return { ...state, activeTaskId: action.task_id };
+      return { ...state, activeTaskId: action.taskId };
     case "toggleSelect": {
       const selected = new Set(state.selected);
-      if (selected.has(action.task_id)) {
-        selected.delete(action.task_id);
+      if (selected.has(action.taskId)) {
+        selected.delete(action.taskId);
       } else {
-        selected.add(action.task_id);
+        selected.add(action.taskId);
       }
       return { ...state, selected };
     }
@@ -256,6 +297,29 @@ function App() {
   const [formBusy, setFormBusy] = useState(false);
   const [modalOpen, setModalOpen] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [logConfig, setLogConfig] = useState<LoggingConfig | null>(null);
+  const [logForm, setLogForm] = useState({ maxFileSizeMb: "", maxTotalSizeMb: "" });
+  const [logFiles, setLogFiles] = useState<LogFileInfo[]>([]);
+  const [selectedLog, setSelectedLog] = useState<string | null>(null);
+  const [logPreview, setLogPreview] = useState("");
+  const [logLoading, setLogLoading] = useState(false);
+const [configSaving, setConfigSaving] = useState(false);
+const [detailTaskId, setDetailTaskId] = useState<string | null>(null);
+  const [taskFilter, setTaskFilter] = useState<TaskStatusFilter>("downloading");
+
+  useEffect(() => {
+    if (detailTaskId && !state.tasks[detailTaskId]) {
+      setDetailTaskId(null);
+    }
+  }, [detailTaskId, state.tasks]);
+
+  useEffect(() => {
+    const last = window.localStorage.getItem(LAST_SAVE_DIR_KEY);
+    if (last) {
+      setForm((prev) => ({ ...prev, saveDir: last }));
+    }
+  }, []);
 
   useEffect(() => {
     let mounted = true;
@@ -322,7 +386,7 @@ function App() {
       case "taskStatus":
         dispatch({
           type: "taskStatus",
-          task_id: event.task_id,
+          taskId: event.taskId,
           status: event.status,
           message: event.message,
         });
@@ -330,29 +394,35 @@ function App() {
       case "segmentUpdated":
         dispatch({
           type: "segmentUpdated",
-          task_id: event.task_id,
+          taskId: event.taskId,
           segment: event.segment,
         });
         break;
       case "logAppended":
         dispatch({
           type: "logAppended",
-          task_id: event.task_id,
+          taskId: event.taskId,
           log: event.log,
         });
         break;
       case "keyStatus":
         dispatch({
           type: "keyStatus",
-          task_id: event.task_id,
+          taskId: event.taskId,
           encryption: event.encryption,
         });
         break;
       case "taskError":
         dispatch({
           type: "taskError",
-          task_id: event.task_id,
+          taskId: event.taskId,
           message: event.message,
+        });
+        break;
+      case "taskRemoved":
+        dispatch({
+          type: "taskRemoved",
+          taskId: event.taskId,
         });
         break;
       default:
@@ -363,13 +433,65 @@ function App() {
   const selectedIds = useMemo(() => Array.from(state.selected), [state.selected]);
   const hasSelection = selectedIds.length > 0;
   const summary = useMemo(() => computeSummary(Object.values(state.tasks)), [state.tasks]);
+  const filterOptions = useMemo(
+    () => [
+      { key: "downloading" as TaskStatusFilter, label: "进行中", count: summary.downloading },
+      { key: "standby" as TaskStatusFilter, label: "排队/暂停", count: summary.standby },
+      { key: "completed" as TaskStatusFilter, label: "已完成", count: summary.completed },
+      { key: "error" as TaskStatusFilter, label: "异常", count: summary.errors },
+    ],
+    [summary],
+  );
+  const filteredOrder = useMemo(() => {
+    const allowed = FILTER_STATUS_MAP[taskFilter];
+    return state.order.filter((taskId) => {
+      const task = state.tasks[taskId];
+      if (!task) return false;
+      return allowed.includes(task.status);
+    });
+  }, [state.order, state.tasks, taskFilter]);
+  const detailTask = detailTaskId ? state.tasks[detailTaskId] ?? null : null;
 
   const handlePauseSelected = async (ids: string[]) => {
     if (ids.length === 0) return;
     try {
-      await invoke("pause_task", { taskIds: ids });
+      await invoke("pause_tasks", { taskIds: ids });
+      dispatch({ type: "clearSelection" });
     } catch (err) {
       console.error(err);
+    }
+  };
+
+  const handleRestartSelected = async (ids: string[]) => {
+    if (ids.length === 0) return;
+    try {
+      await invoke("restart_tasks", { taskIds: ids });
+      // Wait a bit for WebSocket events to arrive
+      await new Promise(resolve => setTimeout(resolve, 100));
+      // Refresh task list to ensure UI is up to date
+      const tasks = await invoke<TaskSnapshot[]>("list_tasks");
+      dispatch({ type: "snapshot", tasks });
+      dispatch({ type: "clearSelection" });
+    } catch (err) {
+      console.error("重启任务失败", err);
+    }
+  };
+
+  const handleDeleteSelected = async (ids: string[]) => {
+    if (ids.length === 0) return;
+    try {
+      await invoke("remove_tasks", { taskIds: ids });
+      // Wait a bit for WebSocket events to arrive
+      await new Promise(resolve => setTimeout(resolve, 100));
+      // Refresh task list to ensure UI is up to date
+      const tasks = await invoke<TaskSnapshot[]>("list_tasks");
+      dispatch({ type: "snapshot", tasks });
+      dispatch({ type: "clearSelection" });
+      if (detailTaskId && ids.includes(detailTaskId)) {
+        setDetailTaskId(null);
+      }
+    } catch (err) {
+      console.error("删除任务失败", err);
     }
   };
   const statusLabel = wsStatus === "connected" ? "WebSocket 已连接" : wsStatus === "connecting" ? "WebSocket 连接中" : "WebSocket 异常";
@@ -384,23 +506,33 @@ function App() {
       setError("请提供 m3u8 链接");
       return;
     }
+    if (!form.saveDir.trim()) {
+      setError("请选择保存路径");
+      return;
+    }
     setError(null);
     setFormBusy(true);
     try {
+      const parsedThreads = Number(form.threads);
+      const threads = Math.min(16, Math.max(1, Number.isFinite(parsedThreads) ? parsedThreads : 6));
+      const saveDir = form.saveDir.trim();
       await invoke("create_task", {
         payload: {
           playlist_url: form.playlistUrl.trim(),
           quality: null,
-          save_dir: form.saveDir.trim(),
+          save_dir: saveDir,
           referer: optional(form.referer),
           headers: optional(form.headers),
           cookies: optional(form.cookies),
           manual_key: optional(form.manualKey),
           manual_iv: optional(form.manualIv),
           title: optional(form.title),
-          max_threads: Number(form.threads) || 6,
+          max_threads: threads,
         },
       });
+      if (saveDir.length > 0) {
+        window.localStorage.setItem(LAST_SAVE_DIR_KEY, saveDir);
+      }
       setForm((prev) => ({
         ...prev,
         title: "",
@@ -415,12 +547,103 @@ function App() {
     }
   };
 
-  const stats = [
-    { label: "进行中", value: summary.downloading },
-    { label: "排队", value: summary.waitingKey },
-    { label: "已完成", value: summary.completed },
-    { label: "异常", value: summary.errors },
-  ];
+  const handlePickDirectory = async () => {
+    if (formBusy) return;
+    try {
+      const selected = await invoke<string | null>("select_save_directory", {
+        payload: {
+          default_path: form.saveDir || window.localStorage.getItem(LAST_SAVE_DIR_KEY),
+        },
+      });
+      if (selected && selected.length > 0) {
+        setForm((prev) => ({ ...prev, saveDir: selected }));
+        window.localStorage.setItem(LAST_SAVE_DIR_KEY, selected);
+      }
+    } catch (err) {
+      console.error("选择目录失败", err);
+    }
+  };
+
+  const refreshLogFiles = async (autoSelect?: string) => {
+    try {
+      const files = await invoke<LogFileInfo[]>("list_log_files");
+      setLogFiles(files);
+      const target = autoSelect
+        || (files.some((f) => f.name === selectedLog) ? selectedLog : files[0]?.name ?? null);
+      if (target) {
+        await handleSelectLogFile(target);
+      } else {
+        setSelectedLog(null);
+        setLogPreview("");
+      }
+    } catch (err) {
+      console.error("加载日志列表失败", err);
+    }
+  };
+
+  const openSettings = async () => {
+    try {
+      const config = await invoke<LoggingConfig>("get_logging_config");
+      setLogConfig(config);
+      setLogForm({
+        maxFileSizeMb: (config.maxFileSizeBytes / (1024 * 1024)).toFixed(2),
+        maxTotalSizeMb: (config.maxTotalSizeBytes / (1024 * 1024)).toFixed(2),
+      });
+      await refreshLogFiles();
+      setSettingsOpen(true);
+    } catch (err) {
+      console.error("打开设置失败", err);
+    }
+  };
+
+  const handleSelectLogFile = async (fileName: string) => {
+    setSelectedLog(fileName);
+    setLogLoading(true);
+    try {
+      const content = await invoke<string>("read_log_file", { fileName, limit: 200_000 });
+      setLogPreview(content);
+    } catch (err) {
+      console.error("读取日志失败", err);
+      setLogPreview("读取日志失败");
+    } finally {
+      setLogLoading(false);
+    }
+  };
+
+  const handleSaveLoggingConfig = async () => {
+    const fileMb = Number(logForm.maxFileSizeMb);
+    const totalMb = Number(logForm.maxTotalSizeMb);
+    if (!Number.isFinite(fileMb) || !Number.isFinite(totalMb) || fileMb <= 0 || totalMb <= 0) {
+      return;
+    }
+    const maxFileBytes = Math.max(1, Math.floor(fileMb * 1024 * 1024));
+    const maxTotalBytes = Math.max(maxFileBytes, Math.floor(totalMb * 1024 * 1024));
+    setConfigSaving(true);
+    try {
+      await invoke("update_logging_config", {
+        config: {
+          max_file_size_bytes: maxFileBytes,
+          max_total_size_bytes: maxTotalBytes,
+        },
+      });
+      const updated = await invoke<LoggingConfig>("get_logging_config");
+      setLogConfig(updated);
+      await refreshLogFiles(selectedLog ?? undefined);
+    } catch (err) {
+      console.error("保存日志配置失败", err);
+    } finally {
+      setConfigSaving(false);
+    }
+  };
+
+  const handleOpenLogDirectory = async () => {
+    try {
+      const dir = await invoke<string>("log_directory_path");
+      await openPath(dir);
+    } catch (err) {
+      console.error("打开日志目录失败", err);
+    }
+  };
 
   return (
     <div className="app-shell">
@@ -433,9 +656,9 @@ function App() {
           </div>
           <button
             className="icon-button"
-            title="设置 (待实现)"
-            disabled
+            title="设置"
             aria-label="设置"
+            onClick={openSettings}
           >
             <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
               <path d="M12 15.5A3.5 3.5 0 1 0 12 8.5a3.5 3.5 0 0 0 0 7z" />
@@ -445,12 +668,18 @@ function App() {
         </div>
       </header>
 
-      <section className="stats-row">
-        {stats.map((stat) => (
-          <div key={stat.label} className="stat-card">
-            <span className="stat-label">{stat.label}</span>
-            <span className="stat-value">{stat.value}</span>
-          </div>
+      <section className="filter-row">
+        {filterOptions.map((option) => (
+          <button
+            key={option.key}
+            type="button"
+            className={`filter-button${taskFilter === option.key ? " is-active" : ""}`}
+            onClick={() => setTaskFilter(option.key)}
+            aria-pressed={taskFilter === option.key}
+          >
+            <span className="filter-label">{option.label}</span>
+            <span className="filter-count">{option.count}</span>
+          </button>
         ))}
       </section>
 
@@ -468,8 +697,11 @@ function App() {
           <button className="toolbar-button" disabled={!hasSelection} onClick={() => handlePauseSelected(selectedIds)}>
             暂停任务
           </button>
-          <button className="toolbar-button" disabled>
-            导入 m3u8
+          <button className="toolbar-button" disabled={!hasSelection} onClick={() => handleRestartSelected(selectedIds)}>
+            重启任务
+          </button>
+          <button className="toolbar-button danger" disabled={!hasSelection} onClick={() => handleDeleteSelected(selectedIds)}>
+            删除任务
           </button>
         </div>
         <div className="toolbar-right">
@@ -485,14 +717,9 @@ function App() {
 
       <section className="task-section">
         <div className="task-list-panel">
-          <div className="panel-title">
-            <h2>下载任务</h2>
-            <span>{summary.totalSegmentsDownloaded} 个分片已完成</span>
-          </div>
           <div className="task-table">
             <div className="task-table-header">
               <span>任务</span>
-              <span>片段</span>
               <span>进度</span>
               <span>速度</span>
               <span>ETA</span>
@@ -500,14 +727,19 @@ function App() {
             </div>
             <div className="task-table-body">
               {state.order.length === 0 && <div className="empty-hint">暂无任务，请创建新的 HLS 下载</div>}
-              {state.order.map((taskId) => {
+              {state.order.length > 0 && filteredOrder.length === 0 && (
+                <div className="empty-hint">暂无该状态的任务</div>
+              )}
+              {filteredOrder.map((taskId) => {
                 const task = state.tasks[taskId];
+                if (!task) return null;
                 return (
                   <TaskRow
                     key={taskId}
                     task={task}
-                    checked={state.selected.has(taskId)}
-                    onToggle={() => dispatch({ type: "toggleSelect", task_id: taskId })}
+                    selected={state.selected.has(taskId)}
+                    onToggle={() => dispatch({ type: "toggleSelect", taskId })}
+                    onOpenDetail={() => setDetailTaskId(taskId)}
                   />
                 );
               })}
@@ -515,6 +747,107 @@ function App() {
           </div>
         </div>
       </section>
+
+      {settingsOpen && (
+        <div
+          className="modal-backdrop"
+          onClick={() => {
+            setSettingsOpen(false);
+          }}
+        >
+          <div
+            className="modal settings-modal"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <header className="modal-header">
+              <div>
+                <h2>应用设置</h2>
+              </div>
+              <button className="ghost-button" onClick={() => setSettingsOpen(false)}>
+                关闭
+              </button>
+            </header>
+            <div className="settings-grid">
+              <section className="settings-section">
+                <h3>日志策略</h3>
+                <label>
+                  单个日志文件上限 (MB)
+                  <input
+                    type="number"
+                    min={1}
+                    step={1}
+                    value={logForm.maxFileSizeMb}
+                    onChange={(e) => setLogForm((prev) => ({ ...prev, maxFileSizeMb: e.target.value }))}
+                  />
+                </label>
+                <label>
+                  日志总容量上限 (MB)
+                  <input
+                    type="number"
+                    min={5}
+                    step={1}
+                    value={logForm.maxTotalSizeMb}
+                    onChange={(e) => setLogForm((prev) => ({ ...prev, maxTotalSizeMb: e.target.value }))}
+                  />
+                </label>
+                <div className="settings-actions">
+                  <button
+                    className="primary-button"
+                    onClick={handleSaveLoggingConfig}
+                    disabled={configSaving}
+                  >
+                    {configSaving ? "保存中..." : "保存设置"}
+                  </button>
+                  <button className="ghost-button" onClick={handleOpenLogDirectory}>
+                    打开日志目录
+                  </button>
+                </div>
+                {logConfig && (
+                  <p className="settings-hint">
+                    当前生效：单个文件 {formatMegabytes(logConfig.maxFileSizeBytes)} / 总容量 {formatMegabytes(logConfig.maxTotalSizeBytes)}
+                  </p>
+                )}
+              </section>
+              <section className="log-viewer">
+                <aside className="log-file-list">
+                  <h3>日志文件</h3>
+                  <ul>
+                    {logFiles.map((file) => (
+                      <li key={file.name}>
+                        <button
+                          className={selectedLog === file.name ? "active" : ""}
+                          onClick={() => handleSelectLogFile(file.name)}
+                        >
+                          <span className="log-name">{file.name}</span>
+                          <span className="log-size">{formatBytes(file.size)}</span>
+                          <span className="log-time">{file.modified ? new Date(file.modified).toLocaleString() : ""}</span>
+                        </button>
+                      </li>
+                    ))}
+                  </ul>
+                </aside>
+                <div className="log-preview">
+                  <h3>日志内容</h3>
+                  {logLoading ? (
+                    <div className="log-placeholder">加载中...</div>
+                  ) : (
+                    <pre>{logPreview || "请选择日志文件"}</pre>
+                  )}
+                </div>
+              </section>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {detailTask && (
+        <TaskDetailModal
+          task={detailTask}
+          onClose={() => setDetailTaskId(null)}
+          onRestart={() => handleRestartSelected([detailTask.id])}
+          onDelete={() => handleDeleteSelected([detailTask.id])}
+        />
+      )}
 
       {modalOpen && (
         <div
@@ -533,7 +866,6 @@ function App() {
             <header className="modal-header">
               <div>
                 <h2>新建 HLS 下载任务</h2>
-                <p>解析 m3u8 后将通过 WebSocket 广播分片计划与 KEY 请求结果</p>
               </div>
               <button
                 className="ghost-button"
@@ -569,13 +901,23 @@ function App() {
                 disabled={formBusy}
                 required
               />
-              <input
-                type="text"
-                placeholder="保存路径，例如 /Users/demo/Videos"
-                value={form.saveDir}
-                onChange={(e) => handleInputChange("saveDir", e.target.value)}
-                disabled={formBusy}
-              />
+              <div className="directory-input-group">
+                <input
+                  type="text"
+                  placeholder="保存路径，例如 /Users/demo/Videos"
+                  value={form.saveDir}
+                  onChange={(e) => handleInputChange("saveDir", e.target.value)}
+                  disabled={formBusy}
+                />
+                <button
+                  type="button"
+                  className="pick-directory-button"
+                  onClick={handlePickDirectory}
+                  disabled={formBusy}
+                >
+                  选择目录
+                </button>
+              </div>
               <input
                 type="text"
                 placeholder="自定义 Referer / Origin（可选）"
@@ -611,15 +953,16 @@ function App() {
                 onChange={(e) => handleInputChange("manualIv", e.target.value)}
                 disabled={formBusy}
               />
-              <select
+              <input
+                type="number"
+                min={1}
+                max={16}
+                step={1}
+                placeholder="并发线程数（1-16）"
                 value={form.threads}
                 onChange={(e) => handleInputChange("threads", e.target.value)}
                 disabled={formBusy}
-              >
-                <option value="4">线程 4</option>
-                <option value="6">线程 6</option>
-                <option value="8">线程 8</option>
-              </select>
+              />
               {error && <p className="error-text">{error}</p>}
               <div className="modal-actions">
                 <button
@@ -646,54 +989,200 @@ function App() {
   );
 }
 
-function TaskRow({ task, checked, onToggle }: { task: TaskSnapshot; checked: boolean; onToggle: () => void }) {
+function TaskRow({
+  task,
+  selected,
+  onToggle,
+  onOpenDetail,
+}: {
+  task: TaskSnapshot;
+  selected: boolean;
+  onToggle: () => void;
+  onOpenDetail: () => void;
+}) {
+  const progressText = `${task.progress.toFixed(2)}%`;
+  const isLongTitle = task.title.length > 18;
+  const etaLabel = typeof task.etaSeconds === "number" ? formatEta(task.etaSeconds) : "估算中";
+  const [titleHover, setTitleHover] = useState(false);
+  const titleSpanRef = useRef<HTMLSpanElement>(null);
+
   return (
-    <div className="task-row" onClick={onToggle}>
-      <div className="task-select" onClick={(e) => { e.stopPropagation(); onToggle(); }}>
-        <input type="checkbox" checked={checked} readOnly />
-      </div>
+    <div
+      className={`task-row ${selected ? "is-selected" : ""}`}
+      onClick={onToggle}
+      onDoubleClick={(event) => {
+        event.stopPropagation();
+        onOpenDetail();
+      }}
+      title={task.title}
+    >
       <div className="task-main">
-        <strong>
-          {task.title}
-          <span className="task-quality">{task.quality ?? "自动"}</span>
-        </strong>
-        <span className="task-source">{task.playlist_url}</span>
-      </div>
-      <div className="task-segments">
-        <span>
-          {task.downloaded_segments}/{task.total_segments}
-        </span>
-        <span className="segments-meta">{task.playlist_type.toUpperCase()}</span>
+        <div
+          className={`task-name ${isLongTitle ? "is-marquee" : ""} ${titleHover ? "is-marquee-active" : ""}`}
+          title={task.title}
+          onMouseEnter={() => {
+            if (isLongTitle) {
+              setTitleHover(true);
+            }
+          }}
+          onMouseLeave={() => {
+            if (isLongTitle) {
+              setTitleHover(false);
+              const span = titleSpanRef.current;
+              if (span) {
+                span.style.animation = "none";
+                // force reflow to reset animation progress
+                void span.offsetWidth;
+                span.style.animation = "";
+                span.style.transform = "";
+              }
+            }
+          }}
+        >
+          <span ref={titleSpanRef}>{task.title}</span>
+        </div>
       </div>
       <div className="task-progress">
         <div className="progress-bar" aria-hidden>
           <div className={`progress-fill status-${task.status}`} style={{ width: `${task.progress}%` }} />
         </div>
-        <span>{task.progress.toFixed(1)}%</span>
+        <span className="progress-value">{progressText}</span>
       </div>
-      <span>{formatSpeed(task.speed_bps)}</span>
-      <span>{task.eta_seconds ? formatEta(task.eta_seconds) : "估算中"}</span>
-      <span className={`status-chip status-${task.status}`}>{taskStatusLabel(task.status)}</span>
+      <span className="task-speed">{formatSpeed(task.speedBps)}</span>
+      <span className="task-eta">{etaLabel}</span>
+      <span className={`status-pill status-${task.status}`}>{taskStatusLabel(task.status)}</span>
     </div>
   );
+}
+
+function TaskDetailModal({
+  task,
+  onClose,
+  onRestart,
+  onDelete,
+}: {
+  task: TaskSnapshot;
+  onClose: () => void;
+  onRestart: () => void;
+  onDelete: () => void;
+}) {
+  const etaLabel = typeof task.etaSeconds === "number" ? formatEta(task.etaSeconds) : "估算中";
+  const stats = [
+    { label: "状态", value: taskStatusLabel(task.status) },
+    { label: "进度", value: `${task.progress.toFixed(2)}%` },
+    { label: "已下载", value: formatBytes(task.downloadedBytes) },
+    { label: "当前速度", value: formatSpeed(task.speedBps) },
+    { label: "总分片", value: task.totalSegments },
+    { label: "剩余时间", value: etaLabel },
+  ];
+  const recentLogs = task.logs.slice(-50).reverse();
+
+  return (
+    <div
+      className="modal-backdrop"
+      onClick={onClose}
+    >
+      <div
+        className="modal task-detail-modal"
+        onClick={(event) => event.stopPropagation()}
+      >
+        <header className="modal-header">
+          <div className="task-detail-header">
+            <h2>{task.title}</h2>
+            <div className="task-detail-subtitle">
+              <span className={`status-pill status-${task.status}`}>{taskStatusLabel(task.status)}</span>
+              <span className="task-detail-id">ID: {task.id}</span>
+            </div>
+            <p className="task-detail-url" title={task.playlistUrl}>
+              {task.playlistUrl}
+            </p>
+          </div>
+          <div className="task-detail-actions">
+            <button className="ghost-button" onClick={onRestart}>
+              重启
+            </button>
+            <button className="ghost-button danger" onClick={onDelete}>
+              删除
+            </button>
+            <button className="ghost-button" onClick={onClose}>
+              关闭
+            </button>
+          </div>
+        </header>
+        <div className="task-detail-grid">
+          <section className="task-detail-info">
+            <h3>概览</h3>
+            <ul>
+              {stats.map((item) => (
+                <li key={item.label}>
+                  <span>{item.label}</span>
+                  <strong>{item.value}</strong>
+                </li>
+              ))}
+              <li>
+                <span>创建时间</span>
+                <strong>{formatLogTime(task.createdAt)}</strong>
+              </li>
+              <li>
+                <span>最近事件</span>
+                <strong>{task.lastEvent ?? "—"}</strong>
+              </li>
+            </ul>
+          </section>
+          <section className="task-detail-logs">
+            <h3>任务日志</h3>
+            <ul className="log-list">
+              {recentLogs.length === 0 ? (
+                <li className="log-entry empty">暂无日志</li>
+              ) : (
+                recentLogs.map((log, index) => (
+                  <li key={`${log.timestamp}-${index}`} className="log-entry">
+                    <span className="log-time">{formatLogTime(log.timestamp)}</span>
+                    <span className="log-message">{log.message}</span>
+                  </li>
+                ))
+              )}
+            </ul>
+          </section>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function formatEta(seconds: number) {
+  if (!Number.isFinite(seconds) || seconds <= 0) {
+    return "0s";
+  }
+  const secs = Math.floor(seconds);
+  const hours = Math.floor(secs / 3600);
+  const mins = Math.floor((secs % 3600) / 60);
+  const rem = secs % 60;
+  if (hours > 0) {
+    return `${hours}h ${mins.toString().padStart(2, "0")}m`;
+  }
+  if (mins > 0) {
+    return `${mins}m ${rem.toString().padStart(2, "0")}s`;
+  }
+  return `${Math.max(rem, 1)}s`;
 }
 
 function computeSummary(tasks: TaskSnapshot[]) {
   let downloading = 0;
   let waitingKey = 0;
+  let standby = 0;
   let completed = 0;
   let errors = 0;
-  let totalSegmentsDownloaded = 0;
 
   tasks.forEach((task) => {
     if (task.status === "downloading") downloading += 1;
     if (task.encryption?.status === "fetching") waitingKey += 1;
+    if (task.status === "queued" || task.status === "paused") standby += 1;
     if (task.status === "completed") completed += 1;
     if (task.status === "error") errors += 1;
-    totalSegmentsDownloaded += task.downloaded_segments;
   });
 
-  return { downloading, waitingKey, completed, errors, totalSegmentsDownloaded };
+  return { downloading, standby, waitingKey, completed, errors };
 }
 
 function formatSpeed(speed: number) {
@@ -702,17 +1191,38 @@ function formatSpeed(speed: number) {
   return `${mb.toFixed(2)} MB/s`;
 }
 
-
-
-function formatEta(seconds: number) {
-  const mins = Math.floor(seconds / 60);
-  const secs = Math.floor(seconds % 60);
-  return `${mins}m ${secs}s`;
+function formatBytes(bytes: number) {
+  if (bytes <= 0) return "0 B";
+  const units = ["B", "KB", "MB", "GB"];
+  let value = bytes;
+  let idx = 0;
+  while (value >= 1024 && idx < units.length - 1) {
+    value /= 1024;
+    idx += 1;
+  }
+  return `${value.toFixed(idx === 0 ? 0 : 2)} ${units[idx]}`;
 }
 
+function formatMegabytes(bytes: number) {
+  return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
+}
 
-
-
+function formatLogTime(timestamp: string) {
+  if (!timestamp) return "";
+  const date = new Date(timestamp);
+  if (Number.isNaN(date.getTime())) {
+    return timestamp;
+  }
+  return date.toLocaleString("zh-CN", {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  });
+}
 
 function taskStatusLabel(status: TaskStatus) {
   switch (status) {

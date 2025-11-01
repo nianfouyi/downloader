@@ -73,6 +73,7 @@ pub struct TaskSnapshot {
     pub save_dir: String,
     pub total_segments: u64,
     pub downloaded_segments: u64,
+    pub downloaded_bytes: u64,
     pub progress: f32,
     pub speed_bps: f64,
     pub status: TaskStatus,
@@ -123,5 +124,8 @@ pub enum FrontendEvent {
     KeyStatus {
         task_id: String,
         encryption: EncryptionSnapshot,
+    },
+    TaskRemoved {
+        task_id: String,
     },
 }
