@@ -7,6 +7,7 @@ type TaskStatus = "queued" | "downloading" | "paused" | "completed" | "error";
 type SegmentStatus = "pending" | "downloading" | "completed" | "failed" | "retrying";
 type EncryptionStatus = "unknown" | "fetching" | "ready" | "failed";
 type TaskStatusFilter = "downloading" | "standby" | "completed" | "error";
+type StatusFilterValue = "all" | TaskStatus;
 
 const FILTER_STATUS_MAP: Record<TaskStatusFilter, TaskStatus[]> = {
   downloading: ["downloading"],
@@ -14,6 +15,25 @@ const FILTER_STATUS_MAP: Record<TaskStatusFilter, TaskStatus[]> = {
   completed: ["completed"],
   error: ["error"],
 };
+
+const ALL_TASK_STATUSES: TaskStatus[] = ["queued", "downloading", "paused", "completed", "error"];
+
+const STATUS_TO_TASK_FILTER: Record<Exclude<StatusFilterValue, "all">, TaskStatusFilter> = {
+  downloading: "downloading",
+  queued: "standby",
+  paused: "standby",
+  completed: "completed",
+  error: "error",
+};
+
+const STATUS_FILTER_OPTIONS: Array<{ value: StatusFilterValue; label: string }> = [
+  { value: "all", label: "全部" },
+  { value: "downloading", label: "下载中" },
+  { value: "queued", label: "排队中" },
+  { value: "paused", label: "已暂停" },
+  { value: "completed", label: "已完成" },
+  { value: "error", label: "异常" },
+];
 interface SegmentSnapshot {
   seq: number;
   status: SegmentStatus;
@@ -117,7 +137,6 @@ const initialState: AppState = {
 const LAST_SAVE_DIR_KEY = "downloader:last-save-dir";
 
 function reducer(state: AppState, action: Action): AppState {
-  console.log("[REDUCER] 处理action:", action.type, action);
   switch (action.type) {
     case "snapshot": {
       const tasks: Record<string, TaskSnapshot> = {};
@@ -125,7 +144,6 @@ function reducer(state: AppState, action: Action): AppState {
         tasks[task.id] = task;
       });
       const order = action.tasks.map((task) => task.id);
-      console.log("[REDUCER] snapshot处理完成, 任务数:", order.length);
       return {
         tasks,
         order,
@@ -137,7 +155,6 @@ function reducer(state: AppState, action: Action): AppState {
       const order = state.order.includes(action.task.id)
         ? state.order
         : [action.task.id, ...state.order];
-      console.log("[REDUCER] taskCreated处理完成, taskId:", action.task.id);
       return {
         ...state,
         tasks: {
@@ -257,8 +274,6 @@ function reducer(state: AppState, action: Action): AppState {
       const selected = new Set(state.selected);
       selected.delete(action.taskId);
       const activeTaskId = state.activeTaskId === action.taskId ? order.find((id) => id !== action.taskId) ?? null : state.activeTaskId;
-      console.log("[REDUCER] 删除后state.tasks:", Object.keys(tasks));
-      console.log("[REDUCER] 删除后state.order:", order);
       return {
         tasks,
         order,
@@ -309,9 +324,12 @@ function App() {
   const [selectedLog, setSelectedLog] = useState<string | null>(null);
   const [logPreview, setLogPreview] = useState("");
   const [logLoading, setLogLoading] = useState(false);
-const [configSaving, setConfigSaving] = useState(false);
-const [detailTaskId, setDetailTaskId] = useState<string | null>(null);
+  const [configSaving, setConfigSaving] = useState(false);
+  const [detailTaskId, setDetailTaskId] = useState<string | null>(null);
   const [taskFilter, setTaskFilter] = useState<TaskStatusFilter>("downloading");
+  const [statusFilter, setStatusFilter] = useState<StatusFilterValue>("all");
+  const [searchTerm, setSearchTerm] = useState("");
+  const [isComposing, setIsComposing] = useState(false);
 
   useEffect(() => {
     if (detailTaskId && !state.tasks[detailTaskId]) {
@@ -375,26 +393,20 @@ const [detailTaskId, setDetailTaskId] = useState<string | null>(null);
   }, []);
 
   const handleEvent = (event: FrontendEvent) => {
-    console.log("[WS_EVENT] 收到WebSocket事件:", event.type, event);
     switch (event.type) {
       case "snapshot":
-        console.log("[WS_EVENT] 处理snapshot事件, 任务数:", event.tasks.length);
         dispatch({ type: "snapshot", tasks: event.tasks });
         break;
       case "taskCreated":
-        console.log("[WS_EVENT] 处理taskCreated事件, taskId:", event.task.id);
         dispatch({ type: "taskCreated", task: event.task });
         break;
       case "taskUpdated":
-        console.log("[WS_EVENT] 处理taskUpdated事件, taskId:", event.task.id);
         dispatch({ type: "taskUpdated", task: event.task });
         break;
       case "taskCompleted":
-        console.log("[WS_EVENT] 处理taskCompleted事件, taskId:", event.task.id);
         dispatch({ type: "taskCompleted", task: event.task });
         break;
       case "taskStatus":
-        console.log("[WS_EVENT] 处理taskStatus事件, taskId:", event.taskId, "status:", event.status);
         dispatch({
           type: "taskStatus",
           taskId: event.taskId,
@@ -417,7 +429,6 @@ const [detailTaskId, setDetailTaskId] = useState<string | null>(null);
         });
         break;
       case "keyStatus":
-        console.log("[WS_EVENT] 处理keyStatus事件, taskId:", event.taskId);
         dispatch({
           type: "keyStatus",
           taskId: event.taskId,
@@ -425,7 +436,6 @@ const [detailTaskId, setDetailTaskId] = useState<string | null>(null);
         });
         break;
       case "taskError":
-        console.log("[WS_EVENT] 处理taskError事件, taskId:", event.taskId, "message:", event.message);
         dispatch({
           type: "taskError",
           taskId: event.taskId,
@@ -433,14 +443,12 @@ const [detailTaskId, setDetailTaskId] = useState<string | null>(null);
         });
         break;
       case "taskRemoved":
-        console.log("[WS_EVENT] 处理taskRemoved事件, taskId:", event.taskId);
         dispatch({
           type: "taskRemoved",
           taskId: event.taskId,
         });
         break;
       default:
-        console.warn("[WS_EVENT] 未知事件类型:", event);
         break;
     }
   };
@@ -457,14 +465,50 @@ const [detailTaskId, setDetailTaskId] = useState<string | null>(null);
     ],
     [summary],
   );
+  useEffect(() => {
+    if (statusFilter === "all") {
+      return;
+    }
+    const mapped = STATUS_TO_TASK_FILTER[statusFilter];
+    if (mapped && mapped !== taskFilter) {
+      setTaskFilter(mapped);
+    }
+  }, [statusFilter, taskFilter]);
+  const normalizedSearch = useMemo(
+    () => (isComposing ? "" : searchTerm.trim().toLowerCase()),
+    [searchTerm, isComposing],
+  );
   const filteredOrder = useMemo(() => {
-    const allowed = FILTER_STATUS_MAP[taskFilter];
+    const allowedStatuses: TaskStatus[] =
+      statusFilter !== "all"
+        ? [statusFilter]
+        : normalizedSearch
+          ? ALL_TASK_STATUSES
+          : FILTER_STATUS_MAP[taskFilter];
     return state.order.filter((taskId) => {
       const task = state.tasks[taskId];
       if (!task) return false;
-      return allowed.includes(task.status);
+      if (!allowedStatuses.includes(task.status)) {
+        return false;
+      }
+      if (normalizedSearch) {
+        const haystack = [
+          task.title,
+          task.playlistUrl,
+          task.outputPath ?? "",
+          task.id,
+          task.quality ?? "",
+          task.resolution ?? "",
+        ]
+          .join(" ")
+          .toLowerCase();
+        if (!haystack.includes(normalizedSearch)) {
+          return false;
+        }
+      }
+      return true;
     });
-  }, [state.order, state.tasks, taskFilter]);
+  }, [state.order, state.tasks, taskFilter, statusFilter, normalizedSearch]);
   const detailTask = detailTaskId ? state.tasks[detailTaskId] ?? null : null;
 
   const handlePauseSelected = async (ids: string[]) => {
@@ -489,17 +533,14 @@ const [detailTaskId, setDetailTaskId] = useState<string | null>(null);
 
   const handleDeleteSelected = async (ids: string[]) => {
     if (ids.length === 0) return;
-    console.log("[DELETE] 开始删除任务, IDs:", ids);
     try {
-      console.log("[DELETE] 调用后端 remove_tasks");
       await invoke("remove_tasks", { taskIds: ids });
-      console.log("[DELETE] 后端调用成功");
       dispatch({ type: "clearSelection" });
       if (detailTaskId && ids.includes(detailTaskId)) {
         setDetailTaskId(null);
       }
     } catch (err) {
-      console.error("[DELETE] 删除任务失败", err);
+      console.error("删除任务失败", err);
     }
   };
   const statusLabel = wsStatus === "connected" ? "WebSocket 已连接" : wsStatus === "connecting" ? "WebSocket 连接中" : "WebSocket 异常";
@@ -682,7 +723,10 @@ const [detailTaskId, setDetailTaskId] = useState<string | null>(null);
             key={option.key}
             type="button"
             className={`filter-button${taskFilter === option.key ? " is-active" : ""}`}
-            onClick={() => setTaskFilter(option.key)}
+            onClick={() => {
+              setTaskFilter(option.key);
+              setStatusFilter("all");
+            }}
             aria-pressed={taskFilter === option.key}
           >
             <span className="filter-label">{option.label}</span>
@@ -713,12 +757,35 @@ const [detailTaskId, setDetailTaskId] = useState<string | null>(null);
           </button>
         </div>
         <div className="toolbar-right">
-          <div className="filter-chip" title="功能待实现">
-            <span>状态</span>
-            <span className="filter-value">全部</span>
+          <div className="filter-chip">
+            <label htmlFor="status-filter">状态</label>
+            <select
+              id="status-filter"
+              value={statusFilter}
+              onChange={(event) => setStatusFilter(event.target.value as StatusFilterValue)}
+            >
+              {STATUS_FILTER_OPTIONS.map((option) => (
+                <option key={option.value} value={option.value}>
+                  {option.label}
+                </option>
+              ))}
+            </select>
           </div>
-          <div className="filter-search" title="功能待实现">
-            <input type="search" placeholder="快速筛选" disabled />
+          <div className="filter-search" title="快速筛选">
+            <input
+              type="text"
+              placeholder="搜索标题、链接或输出路径"
+              value={searchTerm}
+              inputMode="search"
+              onCompositionStart={() => setIsComposing(true)}
+              onCompositionEnd={(event) => {
+                setIsComposing(false);
+                setSearchTerm(event.currentTarget.value);
+              }}
+              onChange={(event) => {
+                setSearchTerm(event.target.value);
+              }}
+            />
           </div>
         </div>
       </section>
