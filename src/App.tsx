@@ -117,6 +117,7 @@ const initialState: AppState = {
 const LAST_SAVE_DIR_KEY = "downloader:last-save-dir";
 
 function reducer(state: AppState, action: Action): AppState {
+  console.log("[REDUCER] 处理action:", action.type, action);
   switch (action.type) {
     case "snapshot": {
       const tasks: Record<string, TaskSnapshot> = {};
@@ -124,6 +125,7 @@ function reducer(state: AppState, action: Action): AppState {
         tasks[task.id] = task;
       });
       const order = action.tasks.map((task) => task.id);
+      console.log("[REDUCER] snapshot处理完成, 任务数:", order.length);
       return {
         tasks,
         order,
@@ -135,6 +137,7 @@ function reducer(state: AppState, action: Action): AppState {
       const order = state.order.includes(action.task.id)
         ? state.order
         : [action.task.id, ...state.order];
+      console.log("[REDUCER] taskCreated处理完成, taskId:", action.task.id);
       return {
         ...state,
         tasks: {
@@ -245,7 +248,11 @@ function reducer(state: AppState, action: Action): AppState {
       };
     }
     case "taskRemoved": {
+      console.log("[REDUCER] 处理taskRemoved, taskId:", action.taskId);
+      console.log("[REDUCER] 删除前state.tasks:", Object.keys(state.tasks));
+      console.log("[REDUCER] 删除前state.order:", state.order);
       if (!state.tasks[action.taskId]) {
+        console.warn("[REDUCER] taskRemoved但任务不存在于state中, taskId:", action.taskId);
         return state;
       }
       const tasks = { ...state.tasks };
@@ -253,7 +260,9 @@ function reducer(state: AppState, action: Action): AppState {
       const order = state.order.filter((id) => id !== action.taskId);
       const selected = new Set(state.selected);
       selected.delete(action.taskId);
-      const activeTaskId = state.activeTaskId === action.taskId ? order[0] ?? null : state.activeTaskId;
+      const activeTaskId = state.activeTaskId === action.taskId ? order.find((id) => id !== action.taskId) ?? null : state.activeTaskId;
+      console.log("[REDUCER] 删除后state.tasks:", Object.keys(tasks));
+      console.log("[REDUCER] 删除后state.order:", order);
       return {
         tasks,
         order,
@@ -370,20 +379,26 @@ const [detailTaskId, setDetailTaskId] = useState<string | null>(null);
   }, []);
 
   const handleEvent = (event: FrontendEvent) => {
+    console.log("[WS_EVENT] 收到WebSocket事件:", event.type, event);
     switch (event.type) {
       case "snapshot":
+        console.log("[WS_EVENT] 处理snapshot事件, 任务数:", event.tasks.length);
         dispatch({ type: "snapshot", tasks: event.tasks });
         break;
       case "taskCreated":
+        console.log("[WS_EVENT] 处理taskCreated事件, taskId:", event.task.id);
         dispatch({ type: "taskCreated", task: event.task });
         break;
       case "taskUpdated":
+        console.log("[WS_EVENT] 处理taskUpdated事件, taskId:", event.task.id);
         dispatch({ type: "taskUpdated", task: event.task });
         break;
       case "taskCompleted":
+        console.log("[WS_EVENT] 处理taskCompleted事件, taskId:", event.task.id);
         dispatch({ type: "taskCompleted", task: event.task });
         break;
       case "taskStatus":
+        console.log("[WS_EVENT] 处理taskStatus事件, taskId:", event.taskId, "status:", event.status);
         dispatch({
           type: "taskStatus",
           taskId: event.taskId,
@@ -406,6 +421,7 @@ const [detailTaskId, setDetailTaskId] = useState<string | null>(null);
         });
         break;
       case "keyStatus":
+        console.log("[WS_EVENT] 处理keyStatus事件, taskId:", event.taskId);
         dispatch({
           type: "keyStatus",
           taskId: event.taskId,
@@ -413,6 +429,7 @@ const [detailTaskId, setDetailTaskId] = useState<string | null>(null);
         });
         break;
       case "taskError":
+        console.log("[WS_EVENT] 处理taskError事件, taskId:", event.taskId, "message:", event.message);
         dispatch({
           type: "taskError",
           taskId: event.taskId,
@@ -420,12 +437,14 @@ const [detailTaskId, setDetailTaskId] = useState<string | null>(null);
         });
         break;
       case "taskRemoved":
+        console.log("[WS_EVENT] 处理taskRemoved事件, taskId:", event.taskId);
         dispatch({
           type: "taskRemoved",
           taskId: event.taskId,
         });
         break;
       default:
+        console.warn("[WS_EVENT] 未知事件类型:", event);
         break;
     }
   };
@@ -466,11 +485,6 @@ const [detailTaskId, setDetailTaskId] = useState<string | null>(null);
     if (ids.length === 0) return;
     try {
       await invoke("restart_tasks", { taskIds: ids });
-      // Wait a bit for WebSocket events to arrive
-      await new Promise(resolve => setTimeout(resolve, 100));
-      // Refresh task list to ensure UI is up to date
-      const tasks = await invoke<TaskSnapshot[]>("list_tasks");
-      dispatch({ type: "snapshot", tasks });
       dispatch({ type: "clearSelection" });
     } catch (err) {
       console.error("重启任务失败", err);
@@ -479,19 +493,17 @@ const [detailTaskId, setDetailTaskId] = useState<string | null>(null);
 
   const handleDeleteSelected = async (ids: string[]) => {
     if (ids.length === 0) return;
+    console.log("[DELETE] 开始删除任务, IDs:", ids);
     try {
+      console.log("[DELETE] 调用后端 remove_tasks");
       await invoke("remove_tasks", { taskIds: ids });
-      // Wait a bit for WebSocket events to arrive
-      await new Promise(resolve => setTimeout(resolve, 100));
-      // Refresh task list to ensure UI is up to date
-      const tasks = await invoke<TaskSnapshot[]>("list_tasks");
-      dispatch({ type: "snapshot", tasks });
+      console.log("[DELETE] 后端调用成功");
       dispatch({ type: "clearSelection" });
       if (detailTaskId && ids.includes(detailTaskId)) {
         setDetailTaskId(null);
       }
     } catch (err) {
-      console.error("删除任务失败", err);
+      console.error("[DELETE] 删除任务失败", err);
     }
   };
   const statusLabel = wsStatus === "connected" ? "WebSocket 已连接" : wsStatus === "connecting" ? "WebSocket 连接中" : "WebSocket 异常";
@@ -865,7 +877,7 @@ const [detailTaskId, setDetailTaskId] = useState<string | null>(null);
           >
             <header className="modal-header">
               <div>
-                <h2>新建 HLS 下载任务</h2>
+                <h2>新建下载任务</h2>
               </div>
               <button
                 className="ghost-button"
@@ -978,7 +990,7 @@ const [detailTaskId, setDetailTaskId] = useState<string | null>(null);
                   取消
                 </button>
                 <button type="submit" className="primary-button" disabled={formBusy}>
-                  {formBusy ? "创建中..." : "解析并添加任务"}
+                  {formBusy ? "创建中..." : "添加任务"}
                 </button>
               </div>
             </form>

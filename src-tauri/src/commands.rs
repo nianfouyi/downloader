@@ -161,25 +161,37 @@ pub async fn remove_tasks(
     manager: State<'_, DownloadManager>,
     task_ids: Vec<String>,
 ) -> Result<(), String> {
+    tracing::info!("[REMOVE_TASKS] 收到删除任务请求, task_ids: {:?}", task_ids);
     if task_ids.is_empty() {
+        tracing::warn!("[REMOVE_TASKS] task_ids为空,直接返回");
         return Ok(());
     }
 
     let mut errors = Vec::new();
     for raw_id in task_ids {
-        match parse_id(raw_id) {
+        tracing::info!("[REMOVE_TASKS] 处理任务ID: {}", raw_id);
+        match parse_id(raw_id.clone()) {
             Ok(id) => {
+                tracing::info!("[REMOVE_TASKS] 调用manager.remove_task, id: {}", id);
                 if let Err(err) = manager.remove_task(id).await {
+                    tracing::error!("[REMOVE_TASKS] 删除任务失败, id: {}, error: {:?}", id, err);
                     errors.push(err.to_string());
+                } else {
+                    tracing::info!("[REMOVE_TASKS] 删除任务成功, id: {}", id);
                 }
             }
-            Err(err) => errors.push(err),
+            Err(err) => {
+                tracing::error!("[REMOVE_TASKS] 解析任务ID失败, raw_id: {}, error: {}", raw_id, err);
+                errors.push(err);
+            }
         }
     }
 
     if errors.is_empty() {
+        tracing::info!("[REMOVE_TASKS] 所有任务删除成功");
         Ok(())
     } else {
+        tracing::error!("[REMOVE_TASKS] 部分任务删除失败: {}", errors.join("; "));
         Err(errors.join("; "))
     }
 }

@@ -536,28 +536,42 @@ impl DownloadManager {
     }
 
     pub async fn remove_task(&self, task_id: TaskId) -> Result<()> {
+        tracing::info!("[REMOVE_TASK] 开始删除任务, task_id: {}", task_id);
         let removed = {
             let mut guard = self.inner.tasks.write();
+            tracing::info!("[REMOVE_TASK] 获取锁成功, 当前任务数: {}", guard.len());
             if let Some(mut task) = guard.remove(&task_id) {
+                tracing::info!("[REMOVE_TASK] 任务已从tasks中移除, task_id: {}", task_id);
                 task.cancel_token.cancel();
                 if let Some(handle) = task.handle.take() {
+                    tracing::info!("[REMOVE_TASK] 中止下载handle, task_id: {}", task_id);
                     handle.abort();
                 }
                 true
             } else {
+                tracing::warn!("[REMOVE_TASK] 任务不存在于tasks中, task_id: {}", task_id);
                 false
             }
         };
 
         if removed {
-            self.inner
-                .websocket
-                .send(FrontendEvent::TaskRemoved {
-                    task_id: task_id.to_string(),
-                })
-                .ok();
+            tracing::info!("[REMOVE_TASK] 准备发送TaskRemoved事件, task_id: {}", task_id);
+            let event = FrontendEvent::TaskRemoved {
+                task_id: task_id.to_string(),
+            };
+            tracing::info!("[REMOVE_TASK] TaskRemoved事件内容: {:?}", event);
+            match self.inner.websocket.send(event) {
+                Ok(_) => {
+                    tracing::info!("[REMOVE_TASK] TaskRemoved事件发送成功, task_id: {}", task_id);
+                }
+                Err(e) => {
+                    tracing::error!("[REMOVE_TASK] TaskRemoved事件发送失败, task_id: {}, error: {:?}", task_id, e);
+                }
+            }
+            tracing::info!("[REMOVE_TASK] 准备持久化状态");
+            self.persist_state();
+            tracing::info!("[REMOVE_TASK] 任务删除完成, task_id: {}", task_id);
         }
-        self.persist_state();
         Ok(())
     }
 

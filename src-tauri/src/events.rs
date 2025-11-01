@@ -101,31 +101,38 @@ pub enum FrontendEvent {
         task: TaskSnapshot,
     },
     TaskCompleted {
+        #[serde(rename = "taskId")]
         task_id: String,
         task: TaskSnapshot,
     },
     TaskStatus {
+        #[serde(rename = "taskId")]
         task_id: String,
         status: TaskStatus,
         message: Option<String>,
     },
     TaskError {
+        #[serde(rename = "taskId")]
         task_id: String,
         message: String,
     },
     SegmentUpdated {
+        #[serde(rename = "taskId")]
         task_id: String,
         segment: SegmentSnapshot,
     },
     LogAppended {
+        #[serde(rename = "taskId")]
         task_id: String,
         log: TaskLog,
     },
     KeyStatus {
+        #[serde(rename = "taskId")]
         task_id: String,
         encryption: EncryptionSnapshot,
     },
     TaskRemoved {
+        #[serde(rename = "taskId")]
         task_id: String,
     },
 }

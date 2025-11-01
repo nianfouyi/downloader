@@ -39,26 +39,65 @@ body,
   margin: 0;
   background: var(--bg);
   color: var(--text-primary);
+  overflow: hidden;
 }
 
 body {
   min-height: 100vh;
 }
 
+/* Custom Scrollbar Styles */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+  margin: 4px 0;
+}
+
+::-webkit-scrollbar-thumb {
+  border-radius: 10px;
+  background: rgba(148, 163, 184, 0.3);
+  border: 2px solid transparent;
+  background-clip: padding-box;
+  transition: background 0.2s ease;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(100, 116, 139, 0.5);
+  background-clip: padding-box;
+}
+
+::-webkit-scrollbar-thumb:active {
+  background: rgba(71, 85, 105, 0.6);
+  background-clip: padding-box;
+}
+
+/* Firefox scrollbar */
+html {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(148, 163, 184, 0.3) transparent;
+}
+
 #root {
   display: flex;
   justify-content: center;
+  height: 100vh;
+  overflow: hidden;
 }
 
 .app-shell {
   width: min(1200px, calc(100vw - 32px));
-  min-height: 100vh;
+  height: 100vh;
   margin: 0 auto;
   display: flex;
   flex-direction: column;
   gap: clamp(16px, 3vw, 28px);
   padding: clamp(16px, 2.5vw, 24px);
   box-sizing: border-box;
+  overflow: hidden;
 }
 
 .app-header {
@@ -310,20 +349,22 @@ body {
 }
 
 .toolbar-button.primary {
-  background: linear-gradient(135deg, #2563eb, #1d4ed8);
-  border-color: transparent;
-  color: #fff;
-  box-shadow: 0 6px 16px rgba(37, 99, 235, 0.25);
+  background: var(--surface);
+  border-color: rgba(148, 163, 184, 0.4);
+  color: var(--text-secondary);
+  box-shadow: none;
 }
 
 .toolbar-button.primary:hover:not(:disabled) {
-  background: linear-gradient(135deg, #1e3fae, #1b47d2);
-  box-shadow: 0 8px 18px rgba(37, 99, 235, 0.3);
+  background: rgba(37, 99, 235, 0.08);
+  border-color: rgba(37, 99, 235, 0.35);
+  color: var(--text-primary);
+  box-shadow: none;
 }
 
 .toolbar-button.primary:active:not(:disabled) {
   transform: translateY(1px);
-  box-shadow: inset 0 2px 6px rgba(15, 23, 42, 0.18);
+  box-shadow: inset 0 2px 6px rgba(15, 23, 42, 0.12);
 }
 
 .toolbar-button.danger {
@@ -405,7 +446,11 @@ body {
 
 
 .task-section {
-  display: block;
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
 }
 
 .task-list-panel {
@@ -416,12 +461,18 @@ body {
   display: flex;
   flex-direction: column;
   gap: 18px;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
 }
 
 .task-table {
   display: flex;
   flex-direction: column;
   gap: 12px;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
 }
 
 .task-table-header,
@@ -444,6 +495,11 @@ body {
   display: flex;
   flex-direction: column;
   gap: 10px;
+  flex: 1;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding-right: 8px;
+  min-height: 0;
 }
 
 .empty-hint {
@@ -674,9 +730,9 @@ body {
 
 .progress-bar {
   flex: 1;
-  height: 6px;
+  height: 4px;
   border-radius: 999px;
-  background: var(--surface);
+  background: rgba(148, 163, 184, 0.15);
   overflow: hidden;
 }
 
@@ -684,26 +740,27 @@ body {
   height: 100%;
   border-radius: inherit;
   transition: width 0.4s ease;
+  opacity: 0.6;
 }
 
 .progress-fill.status-downloading {
-  background: linear-gradient(90deg, #1d4ed8, #2563eb);
+  background: rgba(37, 99, 235, 0.5);
 }
 
 .progress-fill.status-queued {
-  background: var(--amber);
+  background: rgba(245, 158, 11, 0.5);
 }
 
 .progress-fill.status-paused {
-  background: var(--text-secondary);
+  background: rgba(71, 85, 105, 0.4);
 }
 
 .progress-fill.status-completed {
-  background: var(--green);
+  background: rgba(22, 163, 74, 0.5);
 }
 
 .progress-fill.status-error {
-  background: var(--red);
+  background: rgba(220, 38, 38, 0.5);
 }
 
 .task-speed {
@@ -1021,14 +1078,16 @@ progress::-moz-progress-bar {
   background: rgba(15, 23, 42, 0.45);
   display: flex;
   justify-content: center;
-  align-items: flex-start;
-  padding: 10vh 24px 24px;
+  align-items: center;
+  padding: 24px;
   z-index: 1000;
   backdrop-filter: blur(4px);
+  overflow-y: auto;
 }
 
 .modal {
   width: min(740px, 100%);
+  max-height: calc(100vh - 48px);
   background: var(--surface);
   border-radius: 18px;
   border: 1px solid rgba(148, 163, 184, 0.35);
@@ -1038,6 +1097,8 @@ progress::-moz-progress-bar {
   flex-direction: column;
   gap: 18px;
   animation: modal-enter 0.2s ease;
+  overflow-y: auto;
+  margin: auto;
 }
 
 @keyframes modal-enter {
@@ -1073,6 +1134,9 @@ progress::-moz-progress-bar {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 14px 16px;
+  overflow-y: auto;
+  flex: 1;
+  min-height: 0;
 }
 
 .modal-form input,
@@ -1143,6 +1207,10 @@ progress::-moz-progress-bar {
   justify-content: flex-end;
   gap: 12px;
   margin-top: 8px;
+  position: sticky;
+  bottom: 0;
+  background: var(--surface);
+  padding-top: 12px;
 }
 
 .settings-modal {

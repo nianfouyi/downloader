@@ -80,7 +80,18 @@ impl WebSocketState {
         &self,
         event: FrontendEvent,
     ) -> Result<(), broadcast::error::SendError<FrontendEvent>> {
-        self.inner.broadcaster.send(event).map(|_| ())
+        let subscriber_count = self.inner.broadcaster.receiver_count();
+        tracing::info!("[WEBSOCKET_SEND] 准备广播事件到 {} 个订阅者: {:?}", subscriber_count, event);
+        let result = self.inner.broadcaster.send(event);
+        match &result {
+            Ok(receivers) => {
+                tracing::info!("[WEBSOCKET_SEND] 事件广播成功, 接收者数量: {}", receivers);
+            }
+            Err(e) => {
+                tracing::error!("[WEBSOCKET_SEND] 事件广播失败: {:?}", e);
+            }
+        }
+        result.map(|_| ())
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<FrontendEvent> {
@@ -97,10 +108,12 @@ async fn handle_connection(
     state: WebSocketState,
     manager: DownloadManager,
 ) -> Result<()> {
+    tracing::info!("[WS_CONNECTION] 新WebSocket连接建立");
     let ws_stream = tokio_tungstenite::accept_async(stream).await?;
     let (mut sender, mut receiver) = ws_stream.split();
 
     let snapshot: Vec<TaskSnapshot> = manager.snapshot().await.unwrap_or_default();
+    tracing::info!("[WS_CONNECTION] 发送初始snapshot, 任务数: {}", snapshot.len());
     sender
         .send(Message::Text(serde_json::to_string(
             &FrontendEvent::Snapshot { tasks: snapshot },
@@ -108,35 +121,48 @@ async fn handle_connection(
         .await?;
 
     let mut rx = state.subscribe();
+    tracing::info!("[WS_CONNECTION] 开始监听事件");
 
     loop {
         tokio::select! {
             maybe_msg = rx.recv() => {
                 match maybe_msg {
                     Ok(event) => {
+                        tracing::debug!("[WS_CONNECTION] 收到广播事件: {:?}", event);
                         let payload = serde_json::to_string(&event)?;
+                        tracing::debug!("[WS_CONNECTION] 准备发送事件到客户端");
                         if sender.send(Message::Text(payload)).await.is_err() {
+                            tracing::warn!("[WS_CONNECTION] 发送事件到客户端失败,连接断开");
                             break;
                         }
+                        tracing::debug!("[WS_CONNECTION] 事件已发送到客户端");
                     }
                     Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        tracing::warn!("[WS_CONNECTION] 消息丢失 {} 条", skipped);
                         sender.send(Message::Text(serde_json::to_string(&FrontendEvent::TaskError {
                             task_id: "broadcast".into(),
                             message: format!("消息丢失 {skipped} 条，请重新连接"),
                         })?)).await.ok();
                         break;
                     }
-                    Err(broadcast::error::RecvError::Closed) => break,
+                    Err(broadcast::error::RecvError::Closed) => {
+                        tracing::info!("[WS_CONNECTION] 广播通道关闭");
+                        break;
+                    }
                 }
             }
             msg = receiver.next() => {
                 match msg {
-                    Some(Ok(Message::Close(_))) | None => break,
+                    Some(Ok(Message::Close(_))) | None => {
+                        tracing::info!("[WS_CONNECTION] 客户端关闭连接");
+                        break;
+                    }
                     _ => {}
                 }
             }
         }
     }
 
+    tracing::info!("[WS_CONNECTION] WebSocket连接结束");
     Ok(())
 }
