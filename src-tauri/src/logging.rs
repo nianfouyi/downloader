@@ -271,8 +271,7 @@ impl LogInner {
             kept.push(entry);
         }
 
-        let mut kept_total: u64 = kept.iter().map(|e| e.size).sum();
-        total += kept_total;
+        total += kept.iter().map(|entry| entry.size).sum::<u64>();
 
         let max_rotated = max_files.saturating_sub(1);
 
@@ -281,7 +280,6 @@ impl LogInner {
             idx -= 1;
             let removed = kept.remove(idx);
             total -= removed.size;
-            kept_total -= removed.size;
             if let Err(err) = fs::remove_file(&removed.path) {
                 eprintln!(
                     "failed to remove log file {}: {err}",

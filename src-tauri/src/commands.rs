@@ -13,7 +13,8 @@ pub struct CreateTaskPayload {
     pub playlist_url: String,
     pub quality: Option<String>,
     pub save_dir: String,
-    pub referer: Option<String>,
+    #[serde(alias = "referer")]
+    pub page_url: String,
     pub headers: Option<String>,
     pub cookies: Option<String>,
     pub manual_key: Option<String>,
@@ -31,7 +32,7 @@ pub async fn create_task(
         playlist_url: payload.playlist_url,
         preferred_quality: payload.quality,
         save_dir: payload.save_dir,
-        referer: payload.referer,
+        page_url: payload.page_url,
         custom_headers: payload.headers,
         cookies: payload.cookies,
         manual_key: payload.manual_key,
@@ -181,7 +182,11 @@ pub async fn remove_tasks(
                 }
             }
             Err(err) => {
-                tracing::error!("[REMOVE_TASKS] 解析任务ID失败, raw_id: {}, error: {}", raw_id, err);
+                tracing::error!(
+                    "[REMOVE_TASKS] 解析任务ID失败, raw_id: {}, error: {}",
+                    raw_id,
+                    err
+                );
                 errors.push(err);
             }
         }

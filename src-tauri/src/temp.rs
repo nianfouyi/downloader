@@ -305,15 +305,55 @@ fn build_client(user_agent: Option<String>, referer: Option<String>) -> Result<r
             ),
         );
     }
+    headers.insert(
+        reqwest::header::ACCEPT,
+        reqwest::header::HeaderValue::from_static(
+            "application/x-mpegURL, application/vnd.apple.mpegurl, application/octet-stream;q=0.9, */*;q=0.8",
+        ),
+    );
+    headers.insert(
+        reqwest::header::ACCEPT_ENCODING,
+        reqwest::header::HeaderValue::from_static("gzip, deflate, br"),
+    );
+    headers.insert(
+        reqwest::header::HeaderName::from_static("accept-language"),
+        reqwest::header::HeaderValue::from_static("zh-CN,zh;q=0.9,en;q=0.8"),
+    );
+    headers.insert(
+        reqwest::header::HeaderName::from_static("cache-control"),
+        reqwest::header::HeaderValue::from_static("no-cache"),
+    );
+    headers.insert(
+        reqwest::header::HeaderName::from_static("pragma"),
+        reqwest::header::HeaderValue::from_static("no-cache"),
+    );
     if let Some(r) = referer {
         headers.insert(
             reqwest::header::REFERER,
             reqwest::header::HeaderValue::from_str(&r)?,
         );
+        if let Ok(url) = Url::parse(&r) {
+            if let Some(host) = url.host_str() {
+                let mut origin = format!("{}://{}", url.scheme(), host);
+                if let Some(port) = url.port() {
+                    let is_default =
+                        (url.scheme() == "http" && port == 80)
+                            || (url.scheme() == "https" && port == 443);
+                    if !is_default {
+                        origin.push(':');
+                        origin.push_str(&port.to_string());
+                    }
+                }
+                if let Ok(origin) = reqwest::header::HeaderValue::from_str(&origin) {
+                    headers.insert(reqwest::header::HeaderName::from_static("origin"), origin);
+                }
+            }
+        }
     }
 
     let client = reqwest::Client::builder()
         .default_headers(headers)
+        .cookie_store(true)
         .redirect(reqwest::redirect::Policy::limited(10))
         .build()?;
     Ok(client)

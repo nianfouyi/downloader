@@ -307,7 +307,7 @@ function App() {
     title: "",
     playlistUrl: "",
     saveDir: "",
-    referer: "",
+    pageUrl: "",
     headers: "",
     cookies: "",
     manualKey: "",
@@ -559,6 +559,10 @@ function App() {
       setError("请选择保存路径");
       return;
     }
+    if (!form.pageUrl.trim()) {
+      setError("请提供视频页面地址，它会作为首个 m3u8 请求的 Referer");
+      return;
+    }
     setError(null);
     setFormBusy(true);
     try {
@@ -570,7 +574,7 @@ function App() {
           playlist_url: form.playlistUrl.trim(),
           quality: null,
           save_dir: saveDir,
-          referer: optional(form.referer),
+          page_url: form.pageUrl.trim(),
           headers: optional(form.headers),
           cookies: optional(form.cookies),
           manual_key: optional(form.manualKey),
@@ -995,21 +999,22 @@ function App() {
               </div>
               <input
                 type="text"
-                placeholder="自定义 Referer / Origin（可选）"
-                value={form.referer}
-                onChange={(e) => handleInputChange("referer", e.target.value)}
+                placeholder="视频页面地址（必填，用作 Referer，例如 https://example.com/watch/123）"
+                value={form.pageUrl}
+                onChange={(e) => handleInputChange("pageUrl", e.target.value)}
                 disabled={formBusy}
+                required
               />
               <textarea
                 rows={3}
-                placeholder="自定义 Header，每行一个（可选）"
+                placeholder="自定义 Header，每行一个（可选，例如 Origin: https://example.com）"
                 value={form.headers}
                 onChange={(e) => handleInputChange("headers", e.target.value)}
                 disabled={formBusy}
               />
               <input
                 type="text"
-                placeholder="Cookies / Authorization（可选）"
+                placeholder="Cookies / Authorization（可选，优先粘贴浏览器请求里的原始值）"
                 value={form.cookies}
                 onChange={(e) => handleInputChange("cookies", e.target.value)}
                 disabled={formBusy}

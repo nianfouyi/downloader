@@ -70,7 +70,7 @@ pub struct NewTaskRequest {
     pub playlist_url: String,
     pub preferred_quality: Option<String>,
     pub save_dir: String,
-    pub referer: Option<String>,
+    pub page_url: String,
     pub custom_headers: Option<String>,
     pub cookies: Option<String>,
     pub manual_key: Option<String>,
@@ -200,8 +200,13 @@ impl DownloadManager {
         if request.playlist_url.trim().is_empty() {
             return Err(anyhow!("请提供有效的 m3u8 链接"));
         }
+        if request.page_url.trim().is_empty() {
+            return Err(anyhow!("请提供视频页面地址，它会作为首个 m3u8 请求的 Referer"));
+        }
 
         let playlist_url = url::Url::parse(request.playlist_url.trim())?;
+        let page_url = url::Url::parse(request.page_url.trim())
+            .map_err(|_| anyhow!("页面地址格式无效，请输入完整的 http/https 链接"))?;
         let save_dir = self.prep_save_dir(&request.save_dir).await?;
         let title = request
             .title
@@ -250,7 +255,7 @@ impl DownloadManager {
             playlist_url: playlist_url.to_string(),
             save_dir,
             preferred_quality: request.preferred_quality,
-            referer: request.referer,
+            referer: Some(page_url.to_string()),
             custom_headers: request.custom_headers,
             cookies: request.cookies,
             manual_key,
@@ -555,17 +560,27 @@ impl DownloadManager {
         };
 
         if removed {
-            tracing::info!("[REMOVE_TASK] 准备发送TaskRemoved事件, task_id: {}", task_id);
+            tracing::info!(
+                "[REMOVE_TASK] 准备发送TaskRemoved事件, task_id: {}",
+                task_id
+            );
             let event = FrontendEvent::TaskRemoved {
                 task_id: task_id.to_string(),
             };
             tracing::info!("[REMOVE_TASK] TaskRemoved事件内容: {:?}", event);
             match self.inner.websocket.send(event) {
                 Ok(_) => {
-                    tracing::info!("[REMOVE_TASK] TaskRemoved事件发送成功, task_id: {}", task_id);
+                    tracing::info!(
+                        "[REMOVE_TASK] TaskRemoved事件发送成功, task_id: {}",
+                        task_id
+                    );
                 }
                 Err(e) => {
-                    tracing::error!("[REMOVE_TASK] TaskRemoved事件发送失败, task_id: {}, error: {:?}", task_id, e);
+                    tracing::error!(
+                        "[REMOVE_TASK] TaskRemoved事件发送失败, task_id: {}, error: {:?}",
+                        task_id,
+                        e
+                    );
                 }
             }
             tracing::info!("[REMOVE_TASK] 准备持久化状态");

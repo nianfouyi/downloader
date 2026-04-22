@@ -25,4 +25,5 @@ dist-ssr
 .codex*
 .vscode
 dist
+target
 

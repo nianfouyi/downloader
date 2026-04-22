@@ -10,11 +10,11 @@ use m3u8_rs::{
     KeyMethod, MasterPlaylist, MediaPlaylist, MediaPlaylistType, Playlist, VariantStream,
 };
 use reqwest::header::{
-    HeaderMap, HeaderValue, ACCEPT, ACCEPT_ENCODING, COOKIE, REFERER, USER_AGENT,
+    HeaderMap, HeaderName, HeaderValue, ACCEPT, ACCEPT_ENCODING, COOKIE, REFERER, USER_AGENT,
 };
 use reqwest::{Client, StatusCode};
 use std::collections::{BTreeMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::fs::{self, File, OpenOptions};
@@ -30,6 +30,7 @@ const DEFAULT_USER_AGENT: &str =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chromium/123.0.0.0 Safari/537.36";
 const RETRY_BACKOFF_BASE_MS: u64 = 1_000;
 const RETRY_BACKOFF_MAX_MS: u64 = 15_000;
+const MAX_HTTP_ERROR_BODY_CHARS: usize = 240;
 
 #[derive(Clone, Debug)]
 #[allow(dead_code)]
@@ -127,8 +128,14 @@ pub async fn run_hls_download(
     }
 
     let mut resume_state = config.resume.clone();
+    let temp_output_path = prepare_output(&config, "ts").await?;
+    let final_output_path = prepare_output(&config, "mp4").await?;
 
-    let (output_path, mut writer, has_existing_bytes) = if let Some(resume) = resume_state.clone() {
+    let (output_path, mut writer, has_existing_bytes) = if let Some(mut resume) = resume_state.clone()
+    {
+        let resume_output_path =
+            reconcile_resume_output_path(&resume.output_path, &temp_output_path).await?;
+        resume.output_path = resume_output_path.clone();
         match OpenOptions::new()
             .write(true)
             .append(true)
@@ -136,6 +143,7 @@ pub async fn run_hls_download(
             .await
         {
             Ok(file) => {
+                resume_state = Some(resume.clone());
                 let has_existing = match file.metadata().await {
                     Ok(meta) => meta.len() > 0,
                     Err(err) => {
@@ -152,19 +160,17 @@ pub async fn run_hls_download(
                 warn!("resume output missing or inaccessible: {err:?}, 将重新下载");
                 resume_state = None;
                 config.resume = None;
-                let path = prepare_output(&config).await?;
-                let file = File::create(&path)
+                let file = File::create(&temp_output_path)
                     .await
-                    .with_context(|| format!("无法创建输出文件 {}", path.display()))?;
-                (path, file, false)
+                    .with_context(|| format!("无法创建输出文件 {}", temp_output_path.display()))?;
+                (temp_output_path.clone(), file, false)
             }
         }
     } else {
-        let path = prepare_output(&config).await?;
-        let file = File::create(&path)
+        let file = File::create(&temp_output_path)
             .await
-            .with_context(|| format!("无法创建输出文件 {}", path.display()))?;
-        (path, file, false)
+            .with_context(|| format!("无法创建输出文件 {}", temp_output_path.display()))?;
+        (temp_output_path.clone(), file, false)
     };
 
     let should_write_map = !has_existing_bytes;
@@ -239,12 +245,14 @@ pub async fn run_hls_download(
     .await?;
 
     if segments.is_empty() {
+        let completed_output =
+            finalize_output_path(&output_path, &final_output_path).await?;
         manager
             .push_log(config.task_id, "检测到所有分片已完成，跳过下载")
             .await
             .ok();
         manager
-            .mark_task_completed(config.task_id, output_path.clone())
+            .mark_task_completed(config.task_id, completed_output)
             .await?;
         return Ok(());
     }
@@ -273,14 +281,16 @@ pub async fn run_hls_download(
 
     writer.flush().await.ok();
 
+    let completed_output = finalize_output_path(&output_path, &final_output_path).await?;
+
     manager
         .push_log(
             config.task_id,
-            format!("下载完成，输出文件 {}", output_path.display()),
+            format!("下载完成，输出文件 {}", completed_output.display()),
         )
         .await?;
     manager
-        .mark_task_completed(config.task_id, output_path)
+        .mark_task_completed(config.task_id, completed_output)
         .await?;
     Ok(())
 }
@@ -996,12 +1006,7 @@ async fn fetch_bytes(client: &Client, url: &Url, cancel: &CancellationToken) -> 
                     && status != StatusCode::TOO_MANY_REQUESTS
                 {
                     let text = response.text().await.unwrap_or_default();
-                    return Err(anyhow!(
-                        "请求 {} 返回错误状态 {}: {}",
-                        url,
-                        status,
-                        text.trim()
-                    ));
+                    return Err(anyhow!(format_http_error(url, status, &text)));
                 } else {
                     warn!(
                         "请求 {} 返回状态 {} (尝试 {})，将重试",
@@ -1028,6 +1033,7 @@ fn resolve_url(base: &Url, value: &str) -> Result<Url> {
 }
 
 fn build_client(config: &HlsDownloadConfig) -> Result<Client> {
+    let playlist_url = Url::parse(&config.playlist_url).ok();
     let ua_str = config.user_agent.trim();
     let ua = if ua_str.is_empty() {
         DEFAULT_USER_AGENT
@@ -1041,11 +1047,25 @@ fn build_client(config: &HlsDownloadConfig) -> Result<Client> {
     headers.insert(USER_AGENT, ua_header);
     headers.insert(
         ACCEPT,
-        HeaderValue::from_static("application/x-mpegURL, application/vnd.apple.mpegurl, */*"),
+        HeaderValue::from_static(
+            "application/x-mpegURL, application/vnd.apple.mpegurl, application/octet-stream;q=0.9, */*;q=0.8",
+        ),
     );
     headers.insert(
         ACCEPT_ENCODING,
         HeaderValue::from_static("gzip, deflate, br"),
+    );
+    headers.insert(
+        HeaderName::from_static("accept-language"),
+        HeaderValue::from_static("zh-CN,zh;q=0.9,en;q=0.8"),
+    );
+    headers.insert(
+        HeaderName::from_static("cache-control"),
+        HeaderValue::from_static("no-cache"),
+    );
+    headers.insert(
+        HeaderName::from_static("pragma"),
+        HeaderValue::from_static("no-cache"),
     );
 
     if let Some(referer) = config.referer.as_ref().and_then(|r| {
@@ -1067,6 +1087,7 @@ fn build_client(config: &HlsDownloadConfig) -> Result<Client> {
         headers.insert(COOKIE, cookies);
     }
 
+    let origin_header = HeaderName::from_static("origin");
     if let Some(custom) = config.custom_headers.as_ref() {
         for line in custom.lines() {
             let trimmed = line.trim();
@@ -1075,7 +1096,7 @@ fn build_client(config: &HlsDownloadConfig) -> Result<Client> {
             }
             if let Some((name, value)) = trimmed.split_once(':') {
                 if let (Ok(name), Ok(value)) = (
-                    reqwest::header::HeaderName::from_bytes(name.trim().as_bytes()),
+                    HeaderName::from_bytes(name.trim().as_bytes()),
                     HeaderValue::from_str(value.trim()),
                 ) {
                     headers.insert(name, value);
@@ -1084,20 +1105,185 @@ fn build_client(config: &HlsDownloadConfig) -> Result<Client> {
         }
     }
 
+    if !headers.contains_key(&origin_header) {
+        if let Some(origin) = derive_origin_value(config.referer.as_deref(), playlist_url.as_ref())
+        {
+            if let Ok(value) = HeaderValue::from_str(&origin) {
+                headers.insert(origin_header.clone(), value);
+            }
+        }
+    }
+
+    let sec_fetch_mode = HeaderName::from_static("sec-fetch-mode");
+    if !headers.contains_key(&sec_fetch_mode) {
+        headers.insert(sec_fetch_mode, HeaderValue::from_static("cors"));
+    }
+    let sec_fetch_dest = HeaderName::from_static("sec-fetch-dest");
+    if !headers.contains_key(&sec_fetch_dest) {
+        headers.insert(sec_fetch_dest, HeaderValue::from_static("empty"));
+    }
+    let sec_fetch_site = HeaderName::from_static("sec-fetch-site");
+    if !headers.contains_key(&sec_fetch_site) {
+        if let Some(value) = derive_sec_fetch_site(config.referer.as_deref(), playlist_url.as_ref())
+        {
+            headers.insert(sec_fetch_site, HeaderValue::from_static(value));
+        }
+    }
+
     Client::builder()
         .user_agent(ua)
         .default_headers(headers)
+        .cookie_store(true)
+        .redirect(reqwest::redirect::Policy::limited(10))
         .timeout(std::time::Duration::from_secs(30))
         .build()
         .map_err(|err| err.into())
 }
 
-async fn prepare_output(config: &HlsDownloadConfig) -> Result<PathBuf> {
+fn derive_origin_value(referer: Option<&str>, fallback_url: Option<&Url>) -> Option<String> {
+    referer
+        .and_then(parse_origin_from_input)
+        .or_else(|| fallback_url.and_then(origin_from_url))
+}
+
+fn parse_origin_from_input(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let url = Url::parse(trimmed).ok()?;
+    origin_from_url(&url)
+}
+
+fn origin_from_url(url: &Url) -> Option<String> {
+    if !matches!(url.scheme(), "http" | "https") {
+        return None;
+    }
+    let host = url.host_str()?;
+    let mut origin = format!("{}://{}", url.scheme(), host);
+    if let Some(port) = url.port() {
+        let is_default_port =
+            (url.scheme() == "http" && port == 80) || (url.scheme() == "https" && port == 443);
+        if !is_default_port {
+            origin.push(':');
+            origin.push_str(&port.to_string());
+        }
+    }
+    Some(origin)
+}
+
+fn derive_sec_fetch_site(referer: Option<&str>, request_url: Option<&Url>) -> Option<&'static str> {
+    let referer = referer.and_then(|value| Url::parse(value.trim()).ok())?;
+    let request_url = request_url?;
+    let is_same_origin = referer.scheme() == request_url.scheme()
+        && referer.host_str() == request_url.host_str()
+        && referer.port_or_known_default() == request_url.port_or_known_default();
+    if is_same_origin {
+        Some("same-origin")
+    } else {
+        Some("cross-site")
+    }
+}
+
+fn format_http_error(url: &Url, status: StatusCode, body: &str) -> String {
+    if is_cloudflare_block(status, body) {
+        let summary = summarize_response_body(body, 160);
+        return format!(
+            "请求 {} 返回 {}，目标站点触发了 Cloudflare 风控页面。当前版本会自动补齐 Referer/Origin、常见浏览器 Header，并保留服务端下发的 Cookie；如果仍然被拦截，请先在浏览器中打开对应视频页面，再把该 m3u8 请求的 Cookie、Origin 或完整请求头粘贴到任务表单中重试。响应摘要: {}",
+            url, status, summary
+        );
+    }
+
+    format!(
+        "请求 {} 返回错误状态 {}: {}",
+        url,
+        status,
+        summarize_response_body(body, MAX_HTTP_ERROR_BODY_CHARS)
+    )
+}
+
+fn is_cloudflare_block(status: StatusCode, body: &str) -> bool {
+    if status != StatusCode::FORBIDDEN {
+        return false;
+    }
+
+    let lower = body.to_ascii_lowercase();
+    lower.contains("cloudflare")
+        && (lower.contains("attention required")
+            || lower.contains("you have been blocked")
+            || lower.contains("cf-error-details")
+            || lower.contains("please enable cookies"))
+}
+
+fn summarize_response_body(body: &str, max_chars: usize) -> String {
+    let collapsed = body.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.is_empty() {
+        return "<empty body>".into();
+    }
+
+    let mut result = String::new();
+    for ch in collapsed.chars().take(max_chars) {
+        result.push(ch);
+    }
+    if collapsed.chars().count() > max_chars {
+        result.push_str("...");
+    }
+    result
+}
+
+async fn reconcile_resume_output_path(current: &Path, desired: &Path) -> Result<PathBuf> {
+    if current == desired {
+        return Ok(desired.to_path_buf());
+    }
+
+    let current_exists = fs::metadata(current).await.is_ok();
+    let desired_exists = fs::metadata(desired).await.is_ok();
+
+    match (current_exists, desired_exists) {
+        (true, false) => {
+            fs::rename(current, desired).await.with_context(|| {
+                format!(
+                    "无法将临时输出文件从 {} 重命名为 {}",
+                    current.display(),
+                    desired.display()
+                )
+            })?;
+            Ok(desired.to_path_buf())
+        }
+        (false, true) => Ok(desired.to_path_buf()),
+        (true, true) => Ok(current.to_path_buf()),
+        (false, false) => Ok(desired.to_path_buf()),
+    }
+}
+
+async fn finalize_output_path(temp_path: &Path, final_path: &Path) -> Result<PathBuf> {
+    if temp_path == final_path {
+        return Ok(final_path.to_path_buf());
+    }
+
+    if fs::metadata(final_path).await.is_ok() {
+        fs::remove_file(final_path).await.with_context(|| {
+            format!("无法覆盖已存在的输出文件 {}", final_path.display())
+        })?;
+    }
+
+    fs::rename(temp_path, final_path).await.with_context(|| {
+        format!(
+            "无法将临时输出文件从 {} 重命名为 {}",
+            temp_path.display(),
+            final_path.display()
+        )
+    })?;
+
+    Ok(final_path.to_path_buf())
+}
+
+async fn prepare_output(config: &HlsDownloadConfig, extension: &str) -> Result<PathBuf> {
     fs::create_dir_all(&config.save_dir)
         .await
         .with_context(|| format!("无法创建目录 {}", config.save_dir.display()))?;
     let sanitized = sanitize_title(&config.title);
-    Ok(config.save_dir.join(format!("{sanitized}.ts")))
+    Ok(config.save_dir.join(format!("{sanitized}.{extension}")))
 }
 
 fn sanitize_title(input: &str) -> String {
@@ -1127,4 +1313,75 @@ fn generate_iv(seq: u64) -> [u8; 16] {
     let mut iv = [0u8; 16];
     iv[8..].copy_from_slice(&seq.to_be_bytes());
     iv
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        derive_origin_value, derive_sec_fetch_site, format_http_error, is_cloudflare_block,
+        origin_from_url, summarize_response_body,
+    };
+    use reqwest::StatusCode;
+    use url::Url;
+
+    #[test]
+    fn uses_referer_origin_before_playlist_origin() {
+        let playlist_url = Url::parse("https://cdn.example.com/video/master.m3u8").unwrap();
+        let origin = derive_origin_value(
+            Some("https://www.example.com/watch?id=123"),
+            Some(&playlist_url),
+        );
+
+        assert_eq!(origin.as_deref(), Some("https://www.example.com"));
+    }
+
+    #[test]
+    fn derives_origin_from_playlist_when_referer_missing() {
+        let playlist_url = Url::parse("https://media.example.com:8443/live/720p.m3u8").unwrap();
+        let origin = origin_from_url(&playlist_url);
+
+        assert_eq!(origin.as_deref(), Some("https://media.example.com:8443"));
+    }
+
+    #[test]
+    fn derives_sec_fetch_site_from_referer_and_request() {
+        let request = Url::parse("https://cdn.example.com/video/master.m3u8").unwrap();
+
+        assert_eq!(
+            derive_sec_fetch_site(Some("https://cdn.example.com/player"), Some(&request)),
+            Some("same-origin")
+        );
+        assert_eq!(
+            derive_sec_fetch_site(Some("https://www.example.com/watch"), Some(&request)),
+            Some("cross-site")
+        );
+    }
+
+    #[test]
+    fn detects_cloudflare_block_pages() {
+        let body = "<html><title>Attention Required! | Cloudflare</title><div id=\"cf-error-details\">Please enable cookies.</div></html>";
+
+        assert!(is_cloudflare_block(StatusCode::FORBIDDEN, body));
+    }
+
+    #[test]
+    fn formats_cloudflare_error_with_actionable_message() {
+        let url = Url::parse("https://surrit.com/video.m3u8").unwrap();
+        let message = format_http_error(
+            &url,
+            StatusCode::FORBIDDEN,
+            "<html><title>Attention Required! | Cloudflare</title></html>",
+        );
+
+        assert!(message.contains("Cloudflare"));
+        assert!(message.contains("Cookie"));
+        assert!(message.contains("Origin"));
+    }
+
+    #[test]
+    fn trims_and_shortens_error_body() {
+        let summary = summarize_response_body(" a   b \n c ", 5);
+
+        assert_eq!(summary, "a b c");
+    }
 }

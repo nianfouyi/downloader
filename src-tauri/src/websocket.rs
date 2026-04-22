@@ -81,7 +81,11 @@ impl WebSocketState {
         event: FrontendEvent,
     ) -> Result<(), broadcast::error::SendError<FrontendEvent>> {
         let subscriber_count = self.inner.broadcaster.receiver_count();
-        tracing::info!("[WEBSOCKET_SEND] 准备广播事件到 {} 个订阅者: {:?}", subscriber_count, event);
+        tracing::info!(
+            "[WEBSOCKET_SEND] 准备广播事件到 {} 个订阅者: {:?}",
+            subscriber_count,
+            event
+        );
         let result = self.inner.broadcaster.send(event);
         match &result {
             Ok(receivers) => {
@@ -113,7 +117,10 @@ async fn handle_connection(
     let (mut sender, mut receiver) = ws_stream.split();
 
     let snapshot: Vec<TaskSnapshot> = manager.snapshot().await.unwrap_or_default();
-    tracing::info!("[WS_CONNECTION] 发送初始snapshot, 任务数: {}", snapshot.len());
+    tracing::info!(
+        "[WS_CONNECTION] 发送初始snapshot, 任务数: {}",
+        snapshot.len()
+    );
     sender
         .send(Message::Text(serde_json::to_string(
             &FrontendEvent::Snapshot { tasks: snapshot },
