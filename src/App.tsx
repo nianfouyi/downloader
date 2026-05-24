@@ -590,6 +590,7 @@ function App() {
         ...prev,
         title: "",
         playlistUrl: "",
+        pageUrl: "",
       }));
       setModalOpen(false);
     } catch (err: any) {
@@ -745,6 +746,7 @@ function App() {
             className="toolbar-button primary"
             onClick={() => {
               setError(null);
+              setForm((prev) => ({ ...prev, pageUrl: "" }));
               setModalOpen(true);
             }}
           >
