@@ -3,6 +3,7 @@
 mod commands;
 mod events;
 mod hls;
+mod http_api;
 mod logging;
 mod manager;
 mod websocket;
@@ -26,7 +27,8 @@ pub fn run() {
             let ws_state = app.state::<WebSocketState>().inner().clone();
             let manager = DownloadManager::new(app_handle.clone(), ws_state.clone());
             app.manage(manager.clone());
-            ws_state.spawn_listener(app_handle.clone(), manager);
+            ws_state.spawn_listener(app_handle.clone(), manager.clone());
+            http_api::spawn_http_server(manager);
 
             Ok(())
         })
