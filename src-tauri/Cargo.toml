@@ -27,7 +27,8 @@ serde_repr = "0.1"
 anyhow = "1"
 thiserror = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "fs", "time", "io-util"] }
-reqwest = { version = "0.12", features = ["brotli", "cookies", "deflate", "gzip", "json", "stream"] }
+reqwest = { package = "wreq", version = "6.0.0-rc.29", features = ["brotli", "cookies", "deflate", "gzip", "json", "stream"] }
+wreq-util = "3.0.0-rc.14"
 m3u8-rs = "6"
 futures = "0.3"
 tokio-tungstenite = "0.21"
@@ -44,7 +45,6 @@ cbc = "0.1"
 cipher = "0.4"
 base64 = "0.22"
 bytes = "1"
-rand = "0.8"
 directories = "5"
 axum = "0.7"
 tower-http = { version = "0.5", features = ["cors"] }

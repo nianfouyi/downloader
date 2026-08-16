@@ -10,7 +10,7 @@ use m3u8_rs::{
     KeyMethod, MasterPlaylist, MediaPlaylist, MediaPlaylistType, Playlist, VariantStream,
 };
 use reqwest::header::{
-    HeaderMap, HeaderName, HeaderValue, ACCEPT, ACCEPT_ENCODING, COOKIE, REFERER, USER_AGENT,
+    HeaderMap, HeaderName, HeaderValue, COOKIE, REFERER, USER_AGENT,
 };
 use reqwest::{Client, StatusCode};
 use std::collections::{BTreeMap, HashSet};
@@ -23,11 +23,14 @@ use tokio::time::{sleep, Duration};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 use url::Url;
+use wreq_util::{Emulation, Platform, Profile};
 
 type Aes128CbcDec = cbc::Decryptor<aes::Aes128>;
 
 const DEFAULT_USER_AGENT: &str =
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chromium/123.0.0.0 Safari/537.36";
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36";
+const DEFAULT_SEC_CH_UA: &str =
+    r#""Google Chrome";v="147", "Not.A/Brand";v="8", "Chromium";v="147""#;
 const RETRY_BACKOFF_BASE_MS: u64 = 1_000;
 const RETRY_BACKOFF_MAX_MS: u64 = 15_000;
 const MAX_HTTP_ERROR_BODY_CHARS: usize = 240;
@@ -520,7 +523,7 @@ async fn download_segment_once(
     let start = Instant::now();
 
     let response = client
-        .get(entry.uri.clone())
+        .get(entry.uri.as_str())
         .send()
         .await
         .map_err(|err| SegmentError::new(entry.seq, anyhow!(err)))?;
@@ -985,7 +988,7 @@ async fn fetch_bytes(client: &Client, url: &Url, cancel: &CancellationToken) -> 
             return Err(anyhow!("任务已取消"));
         }
 
-        match client.get(url.clone()).send().await {
+        match client.get(url.as_str()).send().await {
             Ok(response) => {
                 let status = response.status();
                 if status.is_success() {
@@ -1033,61 +1036,17 @@ fn resolve_url(base: &Url, value: &str) -> Result<Url> {
 }
 
 fn build_client(config: &HlsDownloadConfig) -> Result<Client> {
-    let playlist_url = Url::parse(&config.playlist_url).ok();
-    let ua_str = config.user_agent.trim();
-    let ua = if ua_str.is_empty() {
-        DEFAULT_USER_AGENT
-    } else {
-        ua_str
-    };
-    let ua_header =
-        HeaderValue::from_str(ua).unwrap_or_else(|_| HeaderValue::from_static(DEFAULT_USER_AGENT));
-
-    let mut headers = HeaderMap::new();
-    headers.insert(USER_AGENT, ua_header);
-    headers.insert(
-        ACCEPT,
-        HeaderValue::from_static(
-            "application/x-mpegURL, application/vnd.apple.mpegurl, application/octet-stream;q=0.9, */*;q=0.8",
-        ),
-    );
-    headers.insert(
-        ACCEPT_ENCODING,
-        HeaderValue::from_static("gzip, deflate, br"),
-    );
-    headers.insert(
-        HeaderName::from_static("accept-language"),
-        HeaderValue::from_static("zh-CN,zh;q=0.9,en;q=0.8"),
-    );
-    headers.insert(
-        HeaderName::from_static("cache-control"),
-        HeaderValue::from_static("no-cache"),
-    );
-    headers.insert(
-        HeaderName::from_static("pragma"),
-        HeaderValue::from_static("no-cache"),
-    );
-
-    if let Some(referer) = config.referer.as_ref().and_then(|r| {
-        if r.trim().is_empty() {
-            None
-        } else {
-            HeaderValue::from_str(r.trim()).ok()
-        }
-    }) {
-        headers.insert(REFERER, referer);
-    }
-    if let Some(cookies) = config.cookies.as_ref().and_then(|c| {
-        if c.trim().is_empty() {
-            None
-        } else {
-            HeaderValue::from_str(c.trim()).ok()
-        }
-    }) {
+    let ua = DEFAULT_USER_AGENT;
+    let mut headers = fixed_browser_headers(config.referer.as_deref());
+    if let Some(cookies) = config
+        .cookies
+        .as_deref()
+        .and_then(normalize_cookie_input)
+        .and_then(|value| HeaderValue::from_str(value).ok())
+    {
         headers.insert(COOKIE, cookies);
     }
 
-    let origin_header = HeaderName::from_static("origin");
     if let Some(custom) = config.custom_headers.as_ref() {
         for line in custom.lines() {
             let trimmed = line.trim();
@@ -1105,32 +1064,14 @@ fn build_client(config: &HlsDownloadConfig) -> Result<Client> {
         }
     }
 
-    if !headers.contains_key(&origin_header) {
-        if let Some(origin) = derive_origin_value(config.referer.as_deref(), playlist_url.as_ref())
-        {
-            if let Ok(value) = HeaderValue::from_str(&origin) {
-                headers.insert(origin_header.clone(), value);
-            }
-        }
-    }
-
-    let sec_fetch_mode = HeaderName::from_static("sec-fetch-mode");
-    if !headers.contains_key(&sec_fetch_mode) {
-        headers.insert(sec_fetch_mode, HeaderValue::from_static("cors"));
-    }
-    let sec_fetch_dest = HeaderName::from_static("sec-fetch-dest");
-    if !headers.contains_key(&sec_fetch_dest) {
-        headers.insert(sec_fetch_dest, HeaderValue::from_static("empty"));
-    }
-    let sec_fetch_site = HeaderName::from_static("sec-fetch-site");
-    if !headers.contains_key(&sec_fetch_site) {
-        if let Some(value) = derive_sec_fetch_site(config.referer.as_deref(), playlist_url.as_ref())
-        {
-            headers.insert(sec_fetch_site, HeaderValue::from_static(value));
-        }
-    }
-
     Client::builder()
+        .emulation(
+            Emulation::builder()
+                .profile(Profile::Chrome147)
+                .platform(Platform::MacOS)
+                .headers(false)
+                .build(),
+        )
         .user_agent(ua)
         .default_headers(headers)
         .cookie_store(true)
@@ -1140,56 +1081,54 @@ fn build_client(config: &HlsDownloadConfig) -> Result<Client> {
         .map_err(|err| err.into())
 }
 
-fn derive_origin_value(referer: Option<&str>, fallback_url: Option<&Url>) -> Option<String> {
-    referer
-        .and_then(parse_origin_from_input)
-        .or_else(|| fallback_url.and_then(origin_from_url))
+fn fixed_browser_headers(referer: Option<&str>) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    headers.insert(USER_AGENT, HeaderValue::from_static(DEFAULT_USER_AGENT));
+    headers.insert(
+        HeaderName::from_static("sec-ch-ua"),
+        HeaderValue::from_static(DEFAULT_SEC_CH_UA),
+    );
+    headers.insert(
+        HeaderName::from_static("sec-ch-ua-mobile"),
+        HeaderValue::from_static("?0"),
+    );
+    headers.insert(
+        HeaderName::from_static("sec-ch-ua-platform"),
+        HeaderValue::from_static("\"macOS\""),
+    );
+    headers.insert(
+        HeaderName::from_static("dnt"),
+        HeaderValue::from_static("1"),
+    );
+
+    if let Some(value) = referer.and_then(|value| HeaderValue::from_str(value.trim()).ok()) {
+        headers.insert(REFERER, value);
+    }
+
+    headers
 }
 
-fn parse_origin_from_input(raw: &str) -> Option<String> {
+fn normalize_cookie_input(raw: &str) -> Option<&str> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return None;
     }
-    let url = Url::parse(trimmed).ok()?;
-    origin_from_url(&url)
-}
 
-fn origin_from_url(url: &Url) -> Option<String> {
-    if !matches!(url.scheme(), "http" | "https") {
-        return None;
-    }
-    let host = url.host_str()?;
-    let mut origin = format!("{}://{}", url.scheme(), host);
-    if let Some(port) = url.port() {
-        let is_default_port =
-            (url.scheme() == "http" && port == 80) || (url.scheme() == "https" && port == 443);
-        if !is_default_port {
-            origin.push(':');
-            origin.push_str(&port.to_string());
+    if let Some((name, value)) = trimmed.split_once(':') {
+        if name.trim().eq_ignore_ascii_case("cookie") {
+            let value = value.trim();
+            return (!value.is_empty()).then_some(value);
         }
     }
-    Some(origin)
-}
 
-fn derive_sec_fetch_site(referer: Option<&str>, request_url: Option<&Url>) -> Option<&'static str> {
-    let referer = referer.and_then(|value| Url::parse(value.trim()).ok())?;
-    let request_url = request_url?;
-    let is_same_origin = referer.scheme() == request_url.scheme()
-        && referer.host_str() == request_url.host_str()
-        && referer.port_or_known_default() == request_url.port_or_known_default();
-    if is_same_origin {
-        Some("same-origin")
-    } else {
-        Some("cross-site")
-    }
+    Some(trimmed)
 }
 
 fn format_http_error(url: &Url, status: StatusCode, body: &str) -> String {
     if is_cloudflare_block(status, body) {
         let summary = summarize_response_body(body, 160);
         return format!(
-            "请求 {} 返回 {}，目标站点触发了 Cloudflare 风控页面。当前版本会自动补齐 Referer/Origin、常见浏览器 Header，并保留服务端下发的 Cookie；如果仍然被拦截，请先在浏览器中打开对应视频页面，再把该 m3u8 请求的 Cookie、Origin 或完整请求头粘贴到任务表单中重试。响应摘要: {}",
+            "请求 {} 返回 {}，目标站点触发了 Cloudflare 风控页面。请求默认使用成功 cURL 对应的 Chrome 147/macOS TLS、HTTP2、User-Agent 和 Client Hints，不会自动生成 Origin；如果任务填写了 Cookie，则会原样携带。请确认任务的“视频页面地址”与浏览器中成功 m3u8 请求的 Referer 完全一致（包括完整路径）；很多 CDN 会把缺失或错误的 Referer 直接伪装成 Cloudflare 拦截。如果浏览器本身也被拦截，则是站点拒绝了当前网络。响应摘要: {}",
             url, status, summary
         );
     }
@@ -1318,43 +1257,41 @@ fn generate_iv(seq: u64) -> [u8; 16] {
 #[cfg(test)]
 mod tests {
     use super::{
-        derive_origin_value, derive_sec_fetch_site, format_http_error, is_cloudflare_block,
-        origin_from_url, summarize_response_body,
+        fixed_browser_headers, format_http_error, is_cloudflare_block, normalize_cookie_input,
+        summarize_response_body, DEFAULT_SEC_CH_UA, DEFAULT_USER_AGENT,
     };
     use reqwest::StatusCode;
     use url::Url;
 
     #[test]
-    fn uses_referer_origin_before_playlist_origin() {
-        let playlist_url = Url::parse("https://cdn.example.com/video/master.m3u8").unwrap();
-        let origin = derive_origin_value(
-            Some("https://www.example.com/watch?id=123"),
-            Some(&playlist_url),
-        );
-
-        assert_eq!(origin.as_deref(), Some("https://www.example.com"));
-    }
-
-    #[test]
-    fn derives_origin_from_playlist_when_referer_missing() {
-        let playlist_url = Url::parse("https://media.example.com:8443/live/720p.m3u8").unwrap();
-        let origin = origin_from_url(&playlist_url);
-
-        assert_eq!(origin.as_deref(), Some("https://media.example.com:8443"));
-    }
-
-    #[test]
-    fn derives_sec_fetch_site_from_referer_and_request() {
-        let request = Url::parse("https://cdn.example.com/video/master.m3u8").unwrap();
+    fn fixed_headers_match_the_successful_browser_request() {
+        let headers = fixed_browser_headers(Some("https://missav.ws/dm32/rctd-028"));
 
         assert_eq!(
-            derive_sec_fetch_site(Some("https://cdn.example.com/player"), Some(&request)),
-            Some("same-origin")
+            headers.get("user-agent").and_then(|value| value.to_str().ok()),
+            Some(DEFAULT_USER_AGENT)
         );
         assert_eq!(
-            derive_sec_fetch_site(Some("https://www.example.com/watch"), Some(&request)),
-            Some("cross-site")
+            headers.get("sec-ch-ua").and_then(|value| value.to_str().ok()),
+            Some(DEFAULT_SEC_CH_UA)
         );
+        assert_eq!(
+            headers.get("sec-ch-ua-mobile").and_then(|value| value.to_str().ok()),
+            Some("?0")
+        );
+        assert_eq!(
+            headers.get("sec-ch-ua-platform").and_then(|value| value.to_str().ok()),
+            Some("\"macOS\"")
+        );
+        assert_eq!(
+            headers.get("referer").and_then(|value| value.to_str().ok()),
+            Some("https://missav.ws/dm32/rctd-028")
+        );
+        assert_eq!(
+            headers.get("dnt").and_then(|value| value.to_str().ok()),
+            Some("1")
+        );
+        assert!(!headers.contains_key("origin"));
     }
 
     #[test]
@@ -1374,8 +1311,8 @@ mod tests {
         );
 
         assert!(message.contains("Cloudflare"));
-        assert!(message.contains("Cookie"));
-        assert!(message.contains("Origin"));
+        assert!(message.contains("Chrome 147/macOS"));
+        assert!(message.contains("Referer"));
     }
 
     #[test]
@@ -1383,5 +1320,18 @@ mod tests {
         let summary = summarize_response_body(" a   b \n c ", 5);
 
         assert_eq!(summary, "a b c");
+    }
+
+    #[test]
+    fn accepts_cookie_header_or_plain_cookie_value() {
+        assert_eq!(
+            normalize_cookie_input("Cookie: cf_clearance=abc; __cf_bm=def"),
+            Some("cf_clearance=abc; __cf_bm=def")
+        );
+        assert_eq!(
+            normalize_cookie_input("cf_clearance=abc; __cf_bm=def"),
+            Some("cf_clearance=abc; __cf_bm=def")
+        );
+        assert_eq!(normalize_cookie_input("Cookie:  "), None);
     }
 }

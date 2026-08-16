@@ -8,8 +8,6 @@ use anyhow::{anyhow, Result};
 use base64::{engine::general_purpose, Engine as _};
 use chrono::Utc;
 use parking_lot::RwLock;
-use rand::seq::SliceRandom;
-use rand::thread_rng;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
@@ -24,16 +22,8 @@ use uuid::Uuid;
 
 const MAX_LOGS: usize = 100;
 
-// Representative desktop user agents sourced from the open-source dataset at
-// https://github.com/intoli/user-agents (captured 2024-03).
-const UA_POOL: &[&str] = &[
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_5_0) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.3 Safari/605.1.15",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.6261.128 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:124.0) Gecko/20100101 Firefox/124.0",
-];
+const DEFAULT_USER_AGENT: &str =
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36";
 
 #[derive(Clone)]
 pub struct DownloadManager {
@@ -56,13 +46,8 @@ struct ManagedTask {
     bytes_at_start: u64,
 }
 
-fn random_user_agent() -> String {
-    let mut rng = thread_rng();
-    UA_POOL
-        .choose(&mut rng)
-        .copied()
-        .unwrap_or(UA_POOL[0])
-        .to_string()
+fn default_user_agent() -> String {
+    DEFAULT_USER_AGENT.to_string()
 }
 
 #[derive(Debug, Deserialize)]
@@ -261,7 +246,7 @@ impl DownloadManager {
             manual_key,
             manual_iv,
             concurrency: request.max_concurrency.clamp(1, 16),
-            user_agent: random_user_agent(),
+            user_agent: default_user_agent(),
             resume: None,
         };
 
@@ -377,23 +362,13 @@ impl DownloadManager {
     }
 
     pub async fn restart_task(&self, task_id: TaskId) -> Result<()> {
-        let status = {
-            let guard = self.inner.tasks.read();
-            let task = guard
-                .get(&task_id)
-                .ok_or_else(|| anyhow!("task not found"))?;
-            task.snapshot.status.clone()
-        };
-
-        let (output_hint, completed_segments, has_remaining, mut base_config) = {
+        let (output_hint, completed_segments, has_remaining, mut base_config, previous_handle) = {
             let mut guard = self.inner.tasks.write();
             let task = guard
                 .get_mut(&task_id)
                 .ok_or_else(|| anyhow!("task not found"))?;
             task.cancel_token.cancel();
-            if let Some(handle) = task.handle.take() {
-                handle.abort();
-            }
+            let previous_handle = task.handle.take();
             let completed: Vec<u64> = task
                 .snapshot
                 .segments
@@ -408,8 +383,19 @@ impl DownloadManager {
                 .any(|seg| seg.status != SegmentStatus::Completed);
             let output_path = task.snapshot.output_path.clone();
             let config_clone = task.config.clone();
-            (output_path, completed, has_remaining, config_clone)
+            (
+                output_path,
+                completed,
+                has_remaining,
+                config_clone,
+                previous_handle,
+            )
         };
+
+        if let Some(handle) = previous_handle {
+            handle.abort();
+            let _ = handle.await;
+        }
 
         if has_remaining && !completed_segments.is_empty() {
             if let Some(path) = output_hint.clone() {
@@ -454,7 +440,7 @@ impl DownloadManager {
                             task.snapshot.progress = 0.0;
                         }
                         task.snapshot.status = TaskStatus::Queued;
-                        task.snapshot.last_event = Some("准备恢复下载".into());
+                        task.snapshot.last_event = Some("任务已重启，准备继续下载".into());
                         task.snapshot.speed_bps = 0.0;
                         task.snapshot.eta_seconds = None;
                         task.snapshot.retries = 0;
@@ -467,7 +453,9 @@ impl DownloadManager {
                     }
                     base_config.resume = Some(resume_state);
                     self.persist_state();
-                    self.push_log(task_id, "继续下载剩余分片").await.ok();
+                    self.push_log(task_id, "任务已重启，继续下载剩余分片")
+                        .await
+                        .ok();
                     self.spawn_download(task_id, base_config);
                     info!(task_id = %task_id, "task restart resumed from checkpoint");
                     return Ok(());
@@ -475,33 +463,7 @@ impl DownloadManager {
             }
         }
 
-        let mut restart_message = "任务已重置，准备重新下载".to_string();
-
-        if status == TaskStatus::Completed {
-            if let Some(ref path) = output_hint {
-                match tokio::fs::metadata(Path::new(path)).await {
-                    Ok(_) => {
-                        self.push_log(
-                            task_id,
-                            format!("任务已完成，输出文件仍存在，无需重启 ({path})"),
-                        )
-                        .await
-                        .ok();
-                        return Ok(());
-                    }
-                    Err(err) => {
-                        if err.kind() == ErrorKind::NotFound {
-                            restart_message = "任务已完成但输出文件缺失，准备重新下载".to_string();
-                        } else {
-                            warn!("failed to stat output {path}: {err:?}");
-                            restart_message = format!("检查输出文件时出错 ({err}), 将重新下载");
-                        }
-                    }
-                }
-            } else {
-                restart_message = "任务已完成但缺少输出文件，准备重新下载".into();
-            }
-        }
+        let restart_message = "任务已重置，准备重新下载".to_string();
 
         let (config, output_path) = self.reset_task_state(task_id, &restart_message)?;
 

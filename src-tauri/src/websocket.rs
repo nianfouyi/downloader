@@ -10,7 +10,7 @@ use tauri::{AppHandle, Emitter};
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
 use tokio_tungstenite::tungstenite::Message;
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 const DEFAULT_PORT: u16 = 9573;
 
@@ -48,22 +48,20 @@ impl WebSocketState {
         drop(started);
 
         let state = self.clone();
+        let app_for_server = app.clone();
         tauri::async_runtime::spawn(async move {
-            if let Err(err) = state.run_server(manager.clone()).await {
+            if let Err(err) = state.run_server(app_for_server, manager.clone()).await {
+                *state.inner.started.lock() = false;
                 error!("WebSocket server error: {err:#}");
             }
         });
-        info!(
-            "WebSocket server listening on ws://127.0.0.1:{}",
-            self.inner.port
-        );
-        app.emit("ws-ready", json!({ "port": self.inner.port }))
-            .ok();
     }
 
-    async fn run_server(&self, manager: DownloadManager) -> Result<()> {
+    async fn run_server(&self, app: AppHandle, manager: DownloadManager) -> Result<()> {
         let addr = SocketAddr::from(([127, 0, 0, 1], self.inner.port));
         let listener = TcpListener::bind(addr).await?;
+        info!("WebSocket server listening on ws://{addr}");
+        app.emit("ws-ready", json!({ "port": self.inner.port }))?;
         loop {
             let (stream, _) = listener.accept().await?;
             let state = self.clone();
@@ -81,21 +79,17 @@ impl WebSocketState {
         event: FrontendEvent,
     ) -> Result<(), broadcast::error::SendError<FrontendEvent>> {
         let subscriber_count = self.inner.broadcaster.receiver_count();
-        tracing::info!(
-            "[WEBSOCKET_SEND] 准备广播事件到 {} 个订阅者: {:?}",
-            subscriber_count,
-            event
-        );
-        let result = self.inner.broadcaster.send(event);
-        match &result {
-            Ok(receivers) => {
-                tracing::info!("[WEBSOCKET_SEND] 事件广播成功, 接收者数量: {}", receivers);
-            }
-            Err(e) => {
-                tracing::error!("[WEBSOCKET_SEND] 事件广播失败: {:?}", e);
-            }
+        if subscriber_count == 0 {
+            debug!("WebSocket 暂无订阅者，跳过实时事件广播");
+            return Ok(());
         }
-        result.map(|_| ())
+
+        if self.inner.broadcaster.send(event).is_err() {
+            // A client can disconnect between receiver_count() and send(). This
+            // is normal and must not be reported as a task/download failure.
+            debug!("WebSocket 客户端在事件广播前断开");
+        }
+        Ok(())
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<FrontendEvent> {
@@ -115,6 +109,7 @@ async fn handle_connection(
     tracing::info!("[WS_CONNECTION] 新WebSocket连接建立");
     let ws_stream = tokio_tungstenite::accept_async(stream).await?;
     let (mut sender, mut receiver) = ws_stream.split();
+    let mut rx = state.subscribe();
 
     let snapshot: Vec<TaskSnapshot> = manager.snapshot().await.unwrap_or_default();
     tracing::info!(
@@ -127,7 +122,6 @@ async fn handle_connection(
         )?))
         .await?;
 
-    let mut rx = state.subscribe();
     tracing::info!("[WS_CONNECTION] 开始监听事件");
 
     loop {
@@ -172,4 +166,38 @@ async fn handle_connection(
 
     tracing::info!("[WS_CONNECTION] WebSocket连接结束");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::WebSocketState;
+    use crate::events::FrontendEvent;
+
+    #[test]
+    fn sending_without_subscribers_is_not_an_error() {
+        let state = WebSocketState::default();
+
+        assert!(state
+            .send(FrontendEvent::TaskRemoved {
+                task_id: "task-1".into(),
+            })
+            .is_ok());
+    }
+
+    #[test]
+    fn subscribed_clients_receive_events() {
+        let state = WebSocketState::default();
+        let mut receiver = state.subscribe();
+
+        state
+            .send(FrontendEvent::TaskRemoved {
+                task_id: "task-2".into(),
+            })
+            .unwrap();
+
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(FrontendEvent::TaskRemoved { task_id }) if task_id == "task-2"
+        ));
+    }
 }

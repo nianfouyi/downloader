@@ -308,7 +308,6 @@ function App() {
     playlistUrl: "",
     saveDir: "",
     pageUrl: "",
-    headers: "",
     cookies: "",
     manualKey: "",
     manualIv: "",
@@ -362,17 +361,43 @@ function App() {
 
   useEffect(() => {
     let cancelled = false;
-    (async () => {
+    let reconnectTimer: number | null = null;
+    let retryCount = 0;
+    let socket: WebSocket | null = null;
+
+    const scheduleReconnect = () => {
+      if (cancelled || reconnectTimer !== null) return;
+      const delay = Math.min(5_000, 300 * 2 ** Math.min(retryCount, 4));
+      retryCount += 1;
+      setWsStatus("connecting");
+      reconnectTimer = window.setTimeout(() => {
+        reconnectTimer = null;
+        connect();
+      }, delay);
+    };
+
+    async function connect() {
       try {
         const endpoint = await invoke<string>("websocket_endpoint");
         if (cancelled) return;
-        const socket = new WebSocket(endpoint);
-        wsRef.current = socket;
+        const currentSocket = new WebSocket(endpoint);
+        socket = currentSocket;
+        wsRef.current = currentSocket;
 
-        socket.onopen = () => setWsStatus("connected");
-        socket.onerror = () => setWsStatus("error");
-        socket.onclose = () => setWsStatus((status) => (status === "connected" ? "error" : status));
-        socket.onmessage = (event) => {
+        currentSocket.onopen = () => {
+          retryCount = 0;
+          setWsStatus("connected");
+        };
+        currentSocket.onerror = () => {
+          if (!cancelled) setWsStatus("error");
+        };
+        currentSocket.onclose = () => {
+          if (wsRef.current === currentSocket) {
+            wsRef.current = null;
+          }
+          scheduleReconnect();
+        };
+        currentSocket.onmessage = (event) => {
           try {
             const payload: FrontendEvent = JSON.parse(event.data);
             handleEvent(payload);
@@ -382,12 +407,20 @@ function App() {
         };
       } catch (err) {
         console.error(err);
-        if (!cancelled) setWsStatus("error");
+        if (!cancelled) {
+          setWsStatus("error");
+          scheduleReconnect();
+        }
       }
-    })();
+    }
+
+    connect();
     return () => {
       cancelled = true;
-      wsRef.current?.close();
+      if (reconnectTimer !== null) {
+        window.clearTimeout(reconnectTimer);
+      }
+      socket?.close();
       wsRef.current = null;
     };
   }, []);
@@ -523,11 +556,27 @@ function App() {
 
   const handleRestartSelected = async (ids: string[]) => {
     if (ids.length === 0) return;
+    ids.forEach((taskId) => {
+      dispatch({
+        type: "taskStatus",
+        taskId,
+        status: "queued",
+        message: "正在重启任务…",
+      });
+    });
     try {
       await invoke("restart_tasks", { taskIds: ids });
+      const tasks = await invoke<TaskSnapshot[]>("list_tasks");
+      dispatch({ type: "snapshot", tasks });
       dispatch({ type: "clearSelection" });
     } catch (err) {
       console.error("重启任务失败", err);
+      try {
+        const tasks = await invoke<TaskSnapshot[]>("list_tasks");
+        dispatch({ type: "snapshot", tasks });
+      } catch (refreshErr) {
+        console.error("刷新任务状态失败", refreshErr);
+      }
     }
   };
 
@@ -575,7 +624,7 @@ function App() {
           quality: null,
           save_dir: saveDir,
           page_url: form.pageUrl.trim(),
-          headers: optional(form.headers),
+          headers: null,
           cookies: optional(form.cookies),
           manual_key: optional(form.manualKey),
           manual_iv: optional(form.manualIv),
@@ -591,6 +640,7 @@ function App() {
         title: "",
         playlistUrl: "",
         pageUrl: "",
+        cookies: "",
       }));
       setModalOpen(false);
     } catch (err: any) {
@@ -1001,22 +1051,15 @@ function App() {
               </div>
               <input
                 type="text"
-                placeholder="视频页面地址（必填，用作 Referer，例如 https://example.com/watch/123）"
+                placeholder="视频页面地址（必须与浏览器成功的 m3u8 请求 Referer 完全一致）"
                 value={form.pageUrl}
                 onChange={(e) => handleInputChange("pageUrl", e.target.value)}
                 disabled={formBusy}
                 required
               />
-              <textarea
-                rows={3}
-                placeholder="自定义 Header，每行一个（可选，例如 Origin: https://example.com）"
-                value={form.headers}
-                onChange={(e) => handleInputChange("headers", e.target.value)}
-                disabled={formBusy}
-              />
               <input
                 type="text"
-                placeholder="Cookies / Authorization（可选，优先粘贴浏览器请求里的原始值）"
+                placeholder="Cookie 请求头（可选，其它需要登录或验证的网站可填写）"
                 value={form.cookies}
                 onChange={(e) => handleInputChange("cookies", e.target.value)}
                 disabled={formBusy}
