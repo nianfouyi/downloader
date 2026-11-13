@@ -39,13 +39,15 @@ pnpm tauri dev
 
 ```bash
 # Build on a Linux host with the packages listed above
-pnpm tauri build
-
-# Optional: target a specific architecture (e.g. x86_64)
-pnpm tauri build --target x86_64-unknown-linux-gnu
+pnpm build:linux
 ```
 
-Artifacts may include `.AppImage`, `.deb`, and tar archives.
+The Linux build uses `src-tauri/tauri.linux.conf.json` and produces a `.deb` package.
+Run it on a Linux host: cross-compiling the Tauri desktop application from macOS or
+Windows requires a Linux sysroot and GTK/WebKit development libraries and is not
+supported by this project’s build script.
+
+The package is written to `src-tauri/target/release/bundle/deb/`.
 
 ### Windows 10/11
 
