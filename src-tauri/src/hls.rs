@@ -53,6 +53,13 @@ pub struct HlsDownloadConfig {
     pub resume: Option<ResumeState>,
 }
 
+impl HlsDownloadConfig {
+    pub fn output_path(&self, extension: &str) -> PathBuf {
+        let sanitized = sanitize_title(&self.title);
+        self.save_dir.join(format!("{sanitized}.{extension}"))
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ResumeState {
     pub completed: Vec<u64>,
@@ -1221,8 +1228,7 @@ async fn prepare_output(config: &HlsDownloadConfig, extension: &str) -> Result<P
     fs::create_dir_all(&config.save_dir)
         .await
         .with_context(|| format!("无法创建目录 {}", config.save_dir.display()))?;
-    let sanitized = sanitize_title(&config.title);
-    Ok(config.save_dir.join(format!("{sanitized}.{extension}")))
+    Ok(config.output_path(extension))
 }
 
 fn sanitize_title(input: &str) -> String {

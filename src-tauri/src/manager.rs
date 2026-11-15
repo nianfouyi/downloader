@@ -4,7 +4,7 @@ use crate::events::{
 };
 use crate::hls::{run_hls_download, HlsDownloadConfig, ResumeState};
 use crate::websocket::WebSocketState;
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use base64::{engine::general_purpose, Engine as _};
 use chrono::Utc;
 use parking_lot::RwLock;
@@ -44,6 +44,54 @@ struct ManagedTask {
     handle: Option<JoinHandle<()>>,
     started_at: Option<Instant>,
     bytes_at_start: u64,
+}
+
+impl ManagedTask {
+    async fn remove_temp_output(&mut self) -> Result<()> {
+        self.cancel_token.cancel();
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+            let _ = handle.await;
+        }
+
+        let mut paths = HashSet::new();
+        if self.snapshot.status != TaskStatus::Completed {
+            // The download may have created the file before recording its path.
+            paths.insert(self.config.output_path("ts"));
+        }
+        for path in self
+            .snapshot
+            .output_path
+            .as_deref()
+            .map(Path::new)
+            .into_iter()
+            .chain(
+                self.config
+                    .resume
+                    .as_ref()
+                    .map(|state| state.output_path.as_path()),
+            )
+        {
+            if path
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("ts"))
+            {
+                paths.insert(path.to_path_buf());
+            }
+        }
+
+        for path in paths {
+            match tokio::fs::remove_file(&path).await {
+                Ok(()) => info!("removed temporary output {}", path.display()),
+                Err(err) if err.kind() == ErrorKind::NotFound => {}
+                Err(err) => {
+                    return Err(err)
+                        .with_context(|| format!("无法删除临时 TS 文件 {}", path.display()));
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 fn default_user_agent() -> String {
@@ -507,21 +555,21 @@ impl DownloadManager {
         let removed = {
             let mut guard = self.inner.tasks.write();
             tracing::info!("[REMOVE_TASK] 获取锁成功, 当前任务数: {}", guard.len());
-            if let Some(mut task) = guard.remove(&task_id) {
-                tracing::info!("[REMOVE_TASK] 任务已从tasks中移除, task_id: {}", task_id);
-                task.cancel_token.cancel();
-                if let Some(handle) = task.handle.take() {
-                    tracing::info!("[REMOVE_TASK] 中止下载handle, task_id: {}", task_id);
-                    handle.abort();
-                }
-                true
-            } else {
-                tracing::warn!("[REMOVE_TASK] 任务不存在于tasks中, task_id: {}", task_id);
-                false
-            }
+            guard.remove(&task_id)
         };
 
-        if removed {
+        if let Some(mut task) = removed {
+            if let Err(err) = task.remove_temp_output().await {
+                task.snapshot.status = TaskStatus::Error;
+                task.snapshot.last_event = Some(format!("{err:#}"));
+                task.snapshot.speed_bps = 0.0;
+                task.snapshot.eta_seconds = None;
+                task.started_at = None;
+                self.broadcast_task(task_id, &task.snapshot);
+                self.inner.tasks.write().insert(task_id, task);
+                self.persist_state();
+                return Err(err);
+            }
             tracing::info!(
                 "[REMOVE_TASK] 准备发送TaskRemoved事件, task_id: {}",
                 task_id
@@ -1248,4 +1296,159 @@ pub struct PlaylistMeta {
     pub quality: Option<String>,
     pub resolution: Option<String>,
     pub audio: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct TestDirectory(PathBuf);
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn task_fixture(status: TaskStatus) -> (TestDirectory, ManagedTask) {
+        let task_id = Uuid::new_v4();
+        let directory = TestDirectory(std::env::temp_dir().join(format!("downloader-{task_id}")));
+        fs::create_dir_all(&directory.0).unwrap();
+        let config = HlsDownloadConfig {
+            task_id,
+            title: "video:episode".into(),
+            playlist_url: "https://example.com/video.m3u8".into(),
+            save_dir: directory.0.clone(),
+            preferred_quality: None,
+            referer: None,
+            custom_headers: None,
+            cookies: None,
+            manual_key: None,
+            manual_iv: None,
+            concurrency: 1,
+            user_agent: default_user_agent(),
+            resume: None,
+        };
+        let snapshot = TaskSnapshot {
+            id: task_id.to_string(),
+            title: config.title.clone(),
+            playlist_url: config.playlist_url.clone(),
+            playlist_type: "vod".into(),
+            quality: None,
+            resolution: None,
+            audio: None,
+            save_dir: directory.0.display().to_string(),
+            total_segments: 2,
+            downloaded_segments: 1,
+            downloaded_bytes: 7,
+            progress: 50.0,
+            speed_bps: 0.0,
+            status,
+            eta_seconds: None,
+            created_at: Utc::now().to_rfc3339(),
+            last_event: None,
+            average_segment_size_bytes: None,
+            retries: 0,
+            encryption: None,
+            segments: Vec::new(),
+            logs: Vec::new(),
+            output_path: Some(config.output_path("ts").display().to_string()),
+        };
+        let task = ManagedTask {
+            snapshot,
+            config,
+            cancel_token: CancellationToken::new(),
+            handle: None,
+            started_at: None,
+            bytes_at_start: 0,
+        };
+        (directory, task)
+    }
+
+    #[tokio::test]
+    async fn removing_temp_output_waits_for_download_to_stop() {
+        let (_directory, mut task) = task_fixture(TaskStatus::Downloading);
+        let output = task.config.output_path("ts");
+        fs::write(&output, b"partial").unwrap();
+
+        struct DownloadOutput(PathBuf);
+        impl Drop for DownloadOutput {
+            fn drop(&mut self) {
+                fs::write(&self.0, b"last write before stopping").unwrap();
+            }
+        }
+
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let worker_output = output.clone();
+        task.handle = Some(JoinHandle::Tokio(tokio::spawn(async move {
+            let _output = DownloadOutput(worker_output);
+            started.send(()).unwrap();
+            std::future::pending::<()>().await;
+        })));
+        ready.await.unwrap();
+
+        task.remove_temp_output().await.unwrap();
+
+        assert!(task.cancel_token.is_cancelled());
+        assert!(task.handle.is_none());
+        assert!(!output.exists());
+    }
+
+    #[tokio::test]
+    async fn removing_temp_output_cleans_restored_and_unrecorded_paths() {
+        let (directory, mut task) = task_fixture(TaskStatus::Paused);
+        let canonical_output = directory.0.join("video_episode.ts");
+        let previous_output = directory.0.join("previous.TS");
+        let resume_output = directory.0.join("resume.ts");
+        for path in [&canonical_output, &previous_output, &resume_output] {
+            fs::write(path, b"partial").unwrap();
+        }
+        task.snapshot.output_path = Some(previous_output.display().to_string());
+        task.config.resume = Some(ResumeState {
+            completed: vec![0],
+            output_path: resume_output.clone(),
+        });
+
+        task.remove_temp_output().await.unwrap();
+
+        for path in [&canonical_output, &previous_output, &resume_output] {
+            assert!(!path.exists(), "{} still exists", path.display());
+        }
+
+        task.snapshot.output_path = None;
+        task.config.resume = None;
+        fs::write(&canonical_output, b"unrecorded output").unwrap();
+        task.remove_temp_output().await.unwrap();
+        assert!(!canonical_output.exists());
+        task.remove_temp_output().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn removing_temp_output_preserves_completed_video_and_other_files() {
+        for status in [TaskStatus::Paused, TaskStatus::Completed] {
+            let (directory, mut task) = task_fixture(status);
+            let video = task.config.output_path("mp4");
+            let unrelated = directory.0.join("other.ts");
+            fs::write(&video, b"completed video").unwrap();
+            fs::write(&unrelated, b"other task").unwrap();
+            task.snapshot.output_path = Some(video.display().to_string());
+
+            task.remove_temp_output().await.unwrap();
+
+            assert_eq!(fs::read(&video).unwrap(), b"completed video");
+            assert_eq!(fs::read(&unrelated).unwrap(), b"other task");
+        }
+    }
+
+    #[tokio::test]
+    async fn removing_temp_output_reports_file_errors() {
+        let (_directory, mut task) = task_fixture(TaskStatus::Error);
+        let output = task.config.output_path("ts");
+        fs::create_dir(&output).unwrap();
+
+        let error = task.remove_temp_output().await.unwrap_err();
+
+        assert!(error.to_string().contains(&output.display().to_string()));
+        assert!(output.is_dir());
+    }
 }
